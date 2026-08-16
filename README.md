@@ -1,21 +1,15 @@
-# Yarış Radar (Android)
+# HorsAI 3.2 Final
 
-Türkiye için TJK günlük yarış programını canlı okuyup koşuları listeler; at bazında AGF, HP, kilo, jokey, son form ve oranlardan açıklanabilir bir skor üretir. Her koşuda favori, rakip, sürpriz ve dar/dengeli/güvenli kupon gösterir. Ayrıca saha/padok notu eklenebilir.
+Türkiye at yarışları için mobil analiz arayüzü.
 
-## Çalıştırma
-1. Android Studio'da klasörü açın.
-2. JDK 17 veya 21 seçin.
-3. Gradle senkronizasyonu sonrası `app` modülünü çalıştırın.
-4. Debug APK: **Build > Build APK(s)**.
+## 3.2 güvenilirlik düzeltmeleri
+- TJK'ya onlarca paralel istek atmak yerine önce günün aktif Türkiye hipodromlarını keşfeder.
+- Resmi TJK YarisSever / Kurumsal / map sayfalarında otomatik fallback kullanır.
+- OkHttp timeout, retry ve HTTP doğrulaması eklendi.
+- TJK tablo başlıkları isimle eşlenir; sabit kolon indexi kullanılmaz.
+- At adı hücresindeki ekipman açıklamalarını ada karıştırmaz.
+- Yarış saatleri ve “sıradaki yarış” hesabı Europe/Istanbul saat diliminde yapılır.
+- Java/Kotlin JVM 17 uyumluluğu sabitlendi.
+- Ana ekranda sıradaki yarış + hızlı erişim, şehir filtreleri ve kupon özetleri korunur.
 
-## Veri
-- Resmî yarış verisi: TJK günlük yarış programı web sayfası.
-- Uygulama, üçüncü taraf yorum sitelerinin kullanım şartlarını ihlal edecek toplu scraping yapmaz. “Web yorumlarını ara” düğmesi ilgili koşu için web aramasını açar.
-- Tahmin skoru bir bahis garantisi değildir; açıklanabilir bir önceliklendirme algoritmasıdır.
-
-## Sonraki üretim adımı
-Gerçek yorumcu konsensüsü için sunucu tarafında izinli API/search entegrasyonu eklenmelidir. `Predictor` ve `TjkRepository` ayrı tutulduğu için kolayca genişletilebilir.
-
-## GitHub Actions APK build
-Every push to `main` triggers `.github/workflows/build-apk.yml`.
-When the workflow finishes, download the artifact named `horsai-debug-apk`; it contains `app-debug.apk`.
+> Not: TJK veya üçüncü taraf kaynak tamamen erişilemezse hiçbir istemci yüzde 100 canlı veri garantisi veremez. Uygulama bu durumda kontrollü hata ekranı gösterir ve yeniden denemeye izin verir.

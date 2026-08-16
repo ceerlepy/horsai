@@ -12,8 +12,8 @@ android {
         applicationId = "com.yarisradar.app"
         minSdk = 26
         targetSdk = 35
-        versionCode = 1
-        versionName = "1.0.0"
+        versionCode = 32
+        versionName = "3.2.0"
     }
 
     compileOptions {
@@ -26,6 +26,10 @@ android {
     packaging {
         resources.excludes += "/META-INF/{AL2.0,LGPL2.1}"
     }
+}
+
+kotlin {
+    jvmToolchain(17)
 }
 
 dependencies {
