@@ -31,6 +31,7 @@ import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
 import org.jsoup.Jsoup
 import org.jsoup.nodes.Document
@@ -456,10 +457,33 @@ fun Home(
     onRace: (Race) -> Unit
 ) {
     var selectedCity by remember(meetings) { mutableStateOf("Tümü") }
-    val cities = remember(meetings) { listOf("Tümü") + meetings.map { it.city }.distinct() }
-    val allRaces = remember(meetings) { meetings.flatMap { it.races } }
-    val upcoming = remember(allRaces) { allRaces.filter { minutesUntil(it.time) >= 0 }.sortedBy { minutesUntil(it.time) } }
-    val visibleMeetings = if (selectedCity == "Tümü") meetings else meetings.filter { it.city == selectedCity }
+    var nowTick by remember { mutableLongStateOf(System.currentTimeMillis()) }
+    LaunchedEffect(Unit) {
+        while (true) {
+            delay(1000)
+            nowTick = System.currentTimeMillis()
+        }
+    }
+
+    // Yalnızca henüz başlamamış koşular uygulamada görünür. Sayaç sıfıra
+    // ulaştığı anda koşu listeden ve şehir filtresinden otomatik kalkar.
+    val activeMeetings = remember(meetings, nowTick) {
+        meetings.mapNotNull { meeting ->
+            val futureRaces = meeting.races
+                .filter { secondsUntil(it.time, nowTick) > 0L }
+                .sortedBy { secondsUntil(it.time, nowTick) }
+            if (futureRaces.isEmpty()) null else meeting.copy(races = futureRaces)
+        }
+    }
+    val cities = remember(activeMeetings) { listOf("Tümü") + activeMeetings.map { it.city }.distinct() }
+    LaunchedEffect(cities) {
+        if (selectedCity !in cities) selectedCity = "Tümü"
+    }
+    val upcoming = remember(activeMeetings, nowTick) {
+        activeMeetings.flatMap { it.races }.sortedBy { secondsUntil(it.time, nowTick) }
+    }
+    val visibleMeetings = if (selectedCity == "Tümü") activeMeetings else activeMeetings.filter { it.city == selectedCity }
+    val activeRaceCount = activeMeetings.sumOf { it.races.size }
 
     Column(Modifier.fillMaxSize()) {
         TopHeader(onRefresh)
@@ -471,30 +495,49 @@ fun Home(
                 contentPadding = PaddingValues(start = 18.dp, end = 18.dp, bottom = 40.dp),
                 verticalArrangement = Arrangement.spacedBy(12.dp)
             ) {
-                item { NextRaceHero(upcoming.firstOrNull(), onRace) }
-                if (upcoming.size > 1) {
-                    item { SectionHeader("Sıradaki yarışlar", "Zamana göre en yakın") }
-                    items(upcoming.take(4)) { race -> UpcomingRaceCard(race, onRace) }
-                }
-                item { CityFilter(cities, selectedCity) { selectedCity = it } }
-                item { SectionHeader("Bugünün programı", "${allRaces.size} koşu · ${meetings.size} şehir") }
-                visibleMeetings.forEach { meeting ->
-                    item { MeetingHeader(meeting) }
-                    items(meeting.races) { race -> RaceCard(race, onRace) }
+                item { NextRaceHero(upcoming.firstOrNull(), nowTick, onRace) }
+                if (upcoming.isNotEmpty()) {
+                    if (upcoming.size > 1) {
+                        item { SectionHeader("Sıradaki yarışlar", "Zamana göre en yakın") }
+                        items(upcoming.drop(1).take(4)) { race -> UpcomingRaceCard(race, nowTick, onRace) }
+                    }
+                    item { CityFilter(cities, selectedCity) { selectedCity = it } }
+                    item { SectionHeader("Kalan yarışlar", "$activeRaceCount koşu · ${activeMeetings.size} şehir") }
+                    visibleMeetings.forEach { meeting ->
+                        item { MeetingHeader(meeting) }
+                        items(meeting.races) { race -> RaceCard(race, nowTick, onRace) }
+                    }
                 }
             }
         }
     }
 }
 
-private fun minutesUntil(time: String): Int {
-    val parts = time.split(":")
-    if (parts.size != 2) return Int.MAX_VALUE
-    val h = parts[0].toIntOrNull() ?: return Int.MAX_VALUE
-    val m = parts[1].toIntOrNull() ?: return Int.MAX_VALUE
-    val now = Calendar.getInstance(java.util.TimeZone.getTimeZone("Europe/Istanbul"))
-    return h * 60 + m - (now.get(Calendar.HOUR_OF_DAY) * 60 + now.get(Calendar.MINUTE))
+private fun secondsUntil(time: String, nowMillis: Long = System.currentTimeMillis()): Long {
+    val parts = time.trim().split(":")
+    if (parts.size != 2) return Long.MAX_VALUE
+    val h = parts[0].toIntOrNull() ?: return Long.MAX_VALUE
+    val m = parts[1].toIntOrNull() ?: return Long.MAX_VALUE
+    val tz = java.util.TimeZone.getTimeZone("Europe/Istanbul")
+    val target = Calendar.getInstance(tz).apply {
+        timeInMillis = nowMillis
+        set(Calendar.HOUR_OF_DAY, h)
+        set(Calendar.MINUTE, m)
+        set(Calendar.SECOND, 0)
+        set(Calendar.MILLISECOND, 0)
+    }
+    return (target.timeInMillis - nowMillis) / 1000L
 }
+
+private fun countdownText(seconds: Long): String {
+    if (seconds <= 0L) return "00:00"
+    val hours = seconds / 3600
+    val mins = (seconds % 3600) / 60
+    val secs = seconds % 60
+    return if (hours > 0) "%02d:%02d:%02d".format(hours, mins, secs)
+    else "%02d:%02d".format(mins, secs)
+}
+
 
 @Composable
 private fun TopHeader(onRefresh: () -> Unit) {
@@ -518,7 +561,7 @@ private fun TopHeader(onRefresh: () -> Unit) {
 }
 
 @Composable
-private fun NextRaceHero(race: Race?, onRace: (Race) -> Unit) {
+private fun NextRaceHero(race: Race?, nowTick: Long, onRace: (Race) -> Unit) {
     Card(
         Modifier.fillMaxWidth().padding(top = 8.dp),
         colors = CardDefaults.cardColors(containerColor = Ink),
@@ -528,14 +571,14 @@ private fun NextRaceHero(race: Race?, onRace: (Race) -> Unit) {
             Column(Modifier.padding(22.dp)) {
                 Text("Bugünkü canlı yarışlar tamamlandı", color = Color.White, fontWeight = FontWeight.Black, fontSize = 21.sp)
                 Spacer(Modifier.height(5.dp))
-                Text("Program aşağıda incelemeye açık.", color = Color.White.copy(.65f), fontSize = 12.sp)
+                Text("Bugün için başlamamış koşu kalmadı.", color = Color.White.copy(.65f), fontSize = 12.sp)
             }
         } else {
-            val mins = minutesUntil(race.time)
+            val secs = secondsUntil(race.time, nowTick)
             Column(Modifier.padding(22.dp)) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Box(Modifier.background(Gold, RoundedCornerShape(50)).padding(horizontal = 11.dp, vertical = 6.dp)) {
-                        Text(if (mins <= 0) "BAŞLIYOR" else "$mins DK KALDI", color = Ink, fontWeight = FontWeight.Black, fontSize = 10.sp)
+                        Text("${countdownText(secs)} KALDI", color = Ink, fontWeight = FontWeight.Black, fontSize = 10.sp)
                     }
                     Spacer(Modifier.weight(1f))
                     Text(race.time, color = Color.White, fontWeight = FontWeight.Black, fontSize = 20.sp)
@@ -559,10 +602,10 @@ private fun NextRaceHero(race: Race?, onRace: (Race) -> Unit) {
 }
 
 @Composable
-private fun UpcomingRaceCard(race: Race, onRace: (Race) -> Unit) {
+private fun UpcomingRaceCard(race: Race, nowTick: Long, onRace: (Race) -> Unit) {
     val picks = remember(race) { Predictor.picks(race) }
     val favorite = picks.firstOrNull()
-    val mins = minutesUntil(race.time)
+    val secs = secondsUntil(race.time, nowTick)
     Card(
         Modifier.fillMaxWidth().clickable { onRace(race) },
         colors = CardDefaults.cardColors(containerColor = Surface),
@@ -572,7 +615,7 @@ private fun UpcomingRaceCard(race: Race, onRace: (Race) -> Unit) {
         Row(Modifier.padding(15.dp), verticalAlignment = Alignment.CenterVertically) {
             Column(Modifier.width(70.dp)) {
                 Text(race.time, fontWeight = FontWeight.Black, fontSize = 18.sp, color = Ink)
-                Text(if (mins < 60) "$mins dk" else "${mins / 60}s ${mins % 60}dk", color = Green, fontWeight = FontWeight.Bold, fontSize = 11.sp)
+                Text(countdownText(secs), color = Green, fontWeight = FontWeight.Bold, fontSize = 11.sp)
             }
             Box(Modifier.width(1.dp).height(44.dp).background(Border))
             Spacer(Modifier.width(13.dp))
@@ -631,7 +674,7 @@ private fun MeetingHeader(meeting: Meeting) {
 }
 
 @Composable
-fun RaceCard(race: Race, onRace: (Race) -> Unit) {
+fun RaceCard(race: Race, nowTick: Long, onRace: (Race) -> Unit) {
     val picks = remember(race) { Predictor.picks(race) }
     val favorite = picks.firstOrNull()
     val surprise = picks.firstOrNull { it.label == "Sürpriz" }
@@ -648,6 +691,8 @@ fun RaceCard(race: Race, onRace: (Race) -> Unit) {
                 }
                 Spacer(Modifier.width(9.dp))
                 Text(race.time, color = Ink, fontWeight = FontWeight.Black, fontSize = 15.sp)
+                Spacer(Modifier.width(7.dp))
+                Text(countdownText(secondsUntil(race.time, nowTick)), color = Green, fontWeight = FontWeight.Bold, fontSize = 10.sp)
                 Spacer(Modifier.weight(1f))
                 Text(listOf(race.distance.takeIf { it.isNotBlank() }?.plus(" m"), race.surface).filterNotNull().joinToString(" · "), color = Muted, fontSize = 11.sp)
             }
