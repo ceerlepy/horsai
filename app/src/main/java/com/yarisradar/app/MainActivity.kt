@@ -128,28 +128,48 @@ object TjkRepository {
             )
         )
 
-        val discoveredCities = discoveryDoc?.let(::discoverDomesticCities).orEmpty()
-        val citiesToLoad = if (discoveredCities.isNotEmpty()) discoveredCities else domesticCities
+        // TJK'nın Page/GunlukYarisProgrami adresi yalnızca toplantı/şehir seçme kabuğunu
+        // döndürüyor. Koşu tabloları şehir linklerindeki Info/Sehir/GunlukYarisProgrami
+        // sayfasında. Bu yüzden şehir adını tahmin edip Page URL'sine eklemek yerine,
+        // TJK'nın kendi ürettiği şehir linklerini aynen takip ediyoruz (SehirId dahil).
+        val cityLinks = discoveryDoc?.let { discoverDomesticCityLinks(it) }.orEmpty()
 
-        // Aynı anda en fazla birkaç istek: daha güvenilir ve TJK sunucusuna daha nazik.
         coroutineScope {
-            citiesToLoad.map { city ->
-                async {
-                    runCatching { loadCity(city, date) }.getOrNull()
-                }
-            }.awaitAll()
-                .filterNotNull()
+            val loaded = if (cityLinks.isNotEmpty()) {
+                cityLinks.map { (city, url) ->
+                    async { runCatching { loadCityFromUrl(city, date, url) }.getOrNull() }
+                }.awaitAll()
+            } else {
+                // Son çare: eski yöntem. Çoğu durumda discovery linkleri bulunduğu için buraya düşmez.
+                domesticCities.map { city ->
+                    async { runCatching { loadCity(city, date) }.getOrNull() }
+                }.awaitAll()
+            }
+
+            loaded.filterNotNull()
                 .filter { it.races.isNotEmpty() }
                 .distinctBy { it.city }
                 .sortedBy { it.races.firstOrNull()?.time ?: "99:99" }
         }
     }
 
+    private fun loadCityFromUrl(city: String, date: String, url: String): Meeting? {
+        val doc = fetchFirst(listOf(url)) ?: return null
+        return parseMeeting(doc, city, date).takeIf { it.races.isNotEmpty() }
+    }
+
     private fun loadCity(city: String, date: String): Meeting? {
+        // Fallback URL'leri şehir detay endpoint'ine gider. Page endpoint'inde yarış tabloları yoktur.
+        // İstanbul için SehirId=3 bilinmektedir; diğer şehirlerde discovery akışı kullanılmalıdır.
+        val cityId = if (city.equals("İstanbul", true)) 3 else null
+        val suffix = buildString {
+            append("?Era=today&QueryParameter_Tarih=${enc(date)}&SehirAdi=${enc(city)}")
+            cityId?.let { append("&SehirId=$it") }
+        }
         val urls = listOf(
-            "$BASE/TR/YarisSever/Info/Page/GunlukYarisProgrami?QueryParameter_Tarih=${enc(date)}&SehirAdi=${enc(city)}",
-            "$BASE/TR/Kurumsal/Info/Page/GunlukYarisProgrami?QueryParameter_Tarih=${enc(date)}&SehirAdi=${enc(city)}",
-            "$BASE/TR/map/Info/Page/GunlukYarisProgrami?QueryParameter_Tarih=${enc(date)}&SehirAdi=${enc(city)}"
+            "$BASE/TR/YarisSever/Info/Sehir/GunlukYarisProgrami$suffix",
+            "$BASE/TR/Kurumsal/Info/Sehir/GunlukYarisProgrami$suffix",
+            "$BASE/TR/map/Info/Sehir/GunlukYarisProgrami$suffix"
         )
         val doc = fetchFirst(urls) ?: return null
         return parseMeeting(doc, city, date).takeIf { it.races.isNotEmpty() }
@@ -192,19 +212,22 @@ object TjkRepository {
         }
     }
 
-    private fun discoverDomesticCities(doc: Document): List<String> {
-        val seen = linkedSetOf<String>()
-        val texts = buildList {
-            addAll(doc.select("a, option, li, button").map { it.text() })
-            add(doc.body().text().take(2500))
-        }
-        texts.forEach { text ->
-            domesticCities.forEach { city ->
-                val rx = Regex("(^|\\s|\\()${Regex.escape(city)}(\\s|\\(|$)", RegexOption.IGNORE_CASE)
-                if (rx.containsMatchIn(text)) seen += city
+    private fun discoverDomesticCityLinks(doc: Document): List<Pair<String, String>> {
+        val found = linkedMapOf<String, String>()
+        doc.select("a[href]").forEach { a ->
+            val text = clean(a.text())
+            val city = domesticCities.firstOrNull { c ->
+                text.equals(c, true) || text.startsWith("$c (", true)
+            } ?: return@forEach
+
+            val href = a.attr("href")
+            if (!href.contains("/Info/Sehir/GunlukYarisProgrami", true)) return@forEach
+            val absolute = a.attr("abs:href").ifBlank {
+                if (href.startsWith("http", true)) href else BASE + if (href.startsWith('/')) href else "/$href"
             }
+            found.putIfAbsent(city, absolute)
         }
-        return seen.toList()
+        return found.entries.map { it.key to it.value }
     }
 
     private fun parseMeeting(doc: Document, city: String, date: String): Meeting {
