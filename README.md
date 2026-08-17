@@ -1,4 +1,4 @@
-# Two Horse 4.5 PRO
+# Two Horse 4.6 PRO
 
 - Balanced transparent confidence scoring (AGF 28, HP 15, form 20, expert 17, odds 10, weight 5, saha 5)
 - Missing metrics are reweighted instead of treated as zero

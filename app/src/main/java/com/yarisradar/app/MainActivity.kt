@@ -180,9 +180,15 @@ object VideoRepository {
             fun videoLinks(doc: Document): List<RaceVideo> = doc.select("a[href]").mapNotNull { a ->
                 val href = a.attr("abs:href").ifBlank { a.attr("href") }
                 if (!href.contains("YarisVideoAt", true)) return@mapNotNull null
-                val label = a.text().replace(Regex("\\s+"), " ").trim()
-                RaceVideo(label.ifBlank { "TJK yarış videosu" }, href)
+                val raw = a.text().replace(Regex("\\s+"), " ").trim()
+                // Menü linkleri de aynı route'u kullanabiliyor (English, TJK, Günlük Bilgiler).
+                // Yalnız gerçek bir geçmiş koşuyu tarif eden satırları kabul et.
+                val looksLikeRace = raw.contains("Koşu", ignoreCase = true) &&
+                    Regex("\\b\\d{2}[./]\\d{2}[./]\\d{4}\\b").containsMatchIn(raw)
+                if (!looksLikeRace) return@mapNotNull null
+                RaceVideo(raw, href)
             }.distinctBy { it.url }
+
 
             val firstDoc = fetch(startUrl) ?: return@withTimeoutOrNull emptyList()
             var links = videoLinks(firstDoc)
@@ -557,7 +563,7 @@ object ExpertRepository {
         val strongWords = listOf("banko", "tek", "favori", "ilk sans", "ilk atim", "birinci sans", "gunun teki")
         val positiveWords = listOf("rakip", "ihmal edilmemeli", "oner", "sansli", "aday", "plase", "degerlendir", "kazanabilir")
         val surpriseWords = listOf("surpriz", "supriz", "bomba", "bombasi", "ters")
-        val negativeWords = listOf("gelmez", "yazmam", "onermiyorum", "sansini az", "sansi az", "dusunmuyorum", "yetersiz", "ele")
+        val negativeWords = listOf("gelmez", "yazmam", "onermiyorum", "onermem", "sansini az", "sansi az", "sans vermiyorum", "dusunmuyorum", "yetersiz", "elenir", "elerim", "elemem")
 
         var directStrong = false
         var directPositive = false
@@ -569,13 +575,21 @@ object ExpertRepository {
         if (needle.length >= 4) {
             var start = text.indexOf(needle)
             while (start >= 0) {
-                val from = max(0, start - 180)
-                val end = min(text.length, start + needle.length + 320)
+                // At adının yakınındaki cümle/ifade dışına taşmamaya çalış. Önceki geniş pencere,
+                // başka atlara ait yorumlardaki kelimeleri bu ata yanlış bağlayabiliyordu.
+                val from = max(0, start - 110)
+                val end = min(text.length, start + needle.length + 180)
                 val snippet = text.substring(from, end)
-                directStrong = directStrong || strongWords.any { snippet.contains(it) } || Regex("★{3,5}").containsMatchIn(snippet)
-                directSurprise = directSurprise || surpriseWords.any { snippet.contains(it) }
-                directPositive = directPositive || directStrong || directSurprise || positiveWords.any { snippet.contains(it) }
-                directNegative = directNegative || negativeWords.any { snippet.contains(it) }
+                val local = snippet
+                    .split(Regex("[.!?;|\n]") )
+                    .firstOrNull { it.contains(needle) }
+                    ?: snippet
+                directStrong = directStrong || strongWords.any { local.contains(it) } || Regex("★{3,5}").containsMatchIn(local)
+                directSurprise = directSurprise || surpriseWords.any { local.contains(it) }
+                directPositive = directPositive || directStrong || directSurprise || positiveWords.any { local.contains(it) }
+                directNegative = directNegative || negativeWords.any { phrase ->
+                    Regex("(^|[^a-z0-9çğıöşü])" + Regex.escape(phrase) + "([^a-z0-9çğıöşü]|$)").containsMatchIn(local)
+                }
 
                 if (listOf("jokeyiyle daha once yaris kazan", "ayni jokeyle daha once kazan", "bu jokeyle daha once kazan").any { snippet.contains(it) }) {
                     saha += 3; notes += "Aynı jokeyle daha önce kazanmış"
@@ -608,8 +622,8 @@ object ExpertRepository {
         labels.forEach { label ->
             var i = text.indexOf(label)
             while (i >= 0) {
-                val from = max(0, i - 90)
-                val end = min(text.length, i + label.length + 110)
+                val from = max(0, i - 65)
+                val end = min(text.length, i + label.length + 85)
                 val snippet = text.substring(from, end)
                 val nums = Regex("\\b\\d{1,2}\\b").findAll(snippet).mapNotNull { it.value.toIntOrNull() }
                     .filter { it in validNos }.toSet()
@@ -1754,9 +1768,17 @@ private fun HorseCard(p: Pick) {
                             } else if (!videoLoading) {
                                 videoLoading = true
                                 scope.launch {
-                                    videos = VideoRepository.loadLast3(videoUrl)
+                                    val found = VideoRepository.loadLast3(videoUrl)
+                                    videos = found
                                     videoLoading = false
-                                    videoExpanded = true
+                                    if (found.isEmpty()) {
+                                        // TJK sayfası satır linklerini HTML'de açık href olarak vermiyorsa,
+                                        // kullanıcıyı tek ve temiz şekilde resmi arşive götür.
+                                        runCatching { context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(videoUrl))) }
+                                        videoExpanded = false
+                                    } else {
+                                        videoExpanded = true
+                                    }
                                 }
                             }
                         },
@@ -1773,7 +1795,7 @@ private fun HorseCard(p: Pick) {
                     }
                     if (videoExpanded) {
                         if (videos.isEmpty() && !videoLoading) {
-                            Text("TJK video arşivinde uygun bağlantı bulunamadı.", color = Muted, fontSize = 9.sp)
+                            Text("Video listesi TJK arşivinde açılır.", color = Muted, fontSize = 9.sp)
                         } else {
                             videos.take(3).forEachIndexed { index, video ->
                                 TextButton(
@@ -1782,7 +1804,7 @@ private fun HorseCard(p: Pick) {
                                 ) {
                                     Icon(Icons.Default.PlayArrow, null, modifier = Modifier.size(14.dp))
                                     Spacer(Modifier.width(4.dp))
-                                    Text(video.label.ifBlank { "Geçmiş yarış ${index + 1}" }, fontSize = 10.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                                    Text("${index + 1}. ${video.label.ifBlank { "Geçmiş yarış" }}", fontSize = 10.sp, maxLines = 2, overflow = TextOverflow.Ellipsis)
                                 }
                             }
                         }
