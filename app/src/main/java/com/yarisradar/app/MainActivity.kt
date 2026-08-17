@@ -1272,12 +1272,35 @@ object Predictor {
             return vals.indexOfFirst { it.first == horse.no }.takeIf { it >= 0 }?.plus(1)
         }
         fun support(h: Horse): ExpertHorseSignal = expert?.byHorse?.get(h.no) ?: ExpertHorseSignal(totalSources = expert?.sourceCount ?: 0)
+        fun expertOnlyScore(signal: ExpertHorseSignal): Double {
+            if (signal.totalSources <= 0) return Double.NEGATIVE_INFINITY
+            val total = signal.totalSources.toDouble()
+            val ratio = signal.support / total
+            val strongRatio = signal.strongSupport / total
+            val favoriteBankoRatio = signal.favoriteBankoSupport / total
+            val surpriseRatio = signal.surpriseSupport / total
+            val negativeRatio = signal.negativeSupport / total
+            // Uzman sırası yalnız uzman görüşlerinden oluşur. Predictor'daki uzman bileşeniyle
+            // aynı mantık kullanılır: normal destek taban, güçlü ve favori/banko ek ağırlık,
+            // sürpriz küçük pozitif sinyal, olumsuz görüş ise düşürücü sinyaldir.
+            return ratio * .54 + strongRatio * .25 + favoriteBankoRatio * .15 +
+                surpriseRatio * .06 - negativeRatio * .38
+        }
         fun expertRank(h: Horse): Int? {
             if ((expert?.sourceCount ?: 0) <= 0) return null
-            if (support(h).support <= 0) return null
-            val ordered = race.horses.map { it.no to support(it).support }
-                .filter { it.second > 0 }
-                .sortedByDescending { it.second }
+            val own = support(h)
+            if (own.support <= 0 && own.favoriteBankoSupport <= 0 && own.strongSupport <= 0) return null
+            val ordered = race.horses
+                .map { horse -> horse.no to support(horse) }
+                .filter { (_, signal) -> signal.support > 0 || signal.favoriteBankoSupport > 0 || signal.strongSupport > 0 }
+                .sortedWith(
+                    compareByDescending<Pair<Int, ExpertHorseSignal>> { expertOnlyScore(it.second) }
+                        .thenByDescending { it.second.favoriteBankoSupport }
+                        .thenByDescending { it.second.strongSupport }
+                        .thenByDescending { it.second.support }
+                        .thenBy { it.second.negativeSupport }
+                        .thenBy { it.first }
+                )
             return ordered.indexOfFirst { it.first == h.no }.takeIf { it >= 0 }?.plus(1)
         }
         fun formScore(last6: String): Double {
@@ -1520,7 +1543,7 @@ fun TwoHorseApp() {
                 selectedRace != null -> RaceDetail(selectedRace!!, expertSignals[raceKey(selectedRace!!)], expertsRefreshing, onBack = { selectedRace = null })
                 selectedHistory != null -> HistoryDetail(selectedHistory!!, onBack = { selectedHistory = null })
                 historyOpen -> HistoryScreen(HistoryStore.load(context), onBack = { historyOpen = false }, onOpen = { selectedHistory = it })
-                sixliOpen -> SixliScreen(meetings, expertSignals, onBack = { sixliOpen = false }, onRace = { selectedRace = it })
+                sixliOpen -> SixliScreen(meetings, expertSignals, expertsRefreshing, onBack = { sixliOpen = false }, onRace = { selectedRace = it })
                 else -> Home(meetings, expertSignals, loading, refreshing, error, { refresh(forceExperts = true) }, { selectedRace = it }, { historyOpen = true }, { sixliOpen = true })
             }
         }
@@ -1700,7 +1723,7 @@ private fun buildSixliCoupons(window: SixliWindow, experts: Map<String, RaceExpe
 }
 
 @Composable
-private fun SixliScreen(meetings: List<Meeting>, experts: Map<String, RaceExpertSignal>, onBack: () -> Unit, onRace: (Race) -> Unit) {
+private fun SixliScreen(meetings: List<Meeting>, experts: Map<String, RaceExpertSignal>, expertsRefreshing: Boolean, onBack: () -> Unit, onRace: (Race) -> Unit) {
     var selectedWindowKey by remember { mutableStateOf<String?>(null) }
     val windows = remember(meetings) { availableSixliWindows(meetings) }
     val selected = windows.firstOrNull { "${it.meeting.city}-${it.startRace}" == selectedWindowKey } ?: windows.firstOrNull()
@@ -1746,8 +1769,21 @@ private fun SixliScreen(meetings: List<Meeting>, experts: Map<String, RaceExpert
                         }
                     }
                 }
-                val coupons = buildSixliCoupons(w, experts)
-                coupons.forEachIndexed { ci, coupon ->
+                if (expertsRefreshing) {
+                    item {
+                        Card(colors = CardDefaults.cardColors(containerColor = Surface), shape = RoundedCornerShape(20.dp), border = CardDefaults.outlinedCardBorder()) {
+                            Row(Modifier.fillMaxWidth().padding(16.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                                CircularProgressIndicator(Modifier.size(20.dp), strokeWidth = 2.dp, color = LoadingBlue)
+                                Column {
+                                    Text("Uzman verileri tamamlanıyor", fontWeight = FontWeight.Black, color = Ink)
+                                    Text("Final 6’lı kupon uzman taraması bitince otomatik hazırlanacak.", color = Muted, fontSize = 11.sp)
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    val coupons = buildSixliCoupons(w, experts)
+                    coupons.forEachIndexed { ci, coupon ->
                     item {
                         Card(colors = CardDefaults.cardColors(containerColor = Surface), shape = RoundedCornerShape(20.dp), border = CardDefaults.outlinedCardBorder()) {
                             Column(Modifier.fillMaxWidth().padding(16.dp)) {
@@ -1782,8 +1818,10 @@ private fun SixliScreen(meetings: List<Meeting>, experts: Map<String, RaceExpert
                         }
                     }
                 }
-                item {
-                    Text("Not: 6’lı Ganyan, TJK’ya göre aynı gün belirlenen 6 koşunun birincilerini bulma oyunudur. Kuponlar tahmindir; kombinasyon sayısı seçilen at adetlerinin çarpımıdır.", color = Muted, fontSize = 10.sp, modifier = Modifier.padding(bottom = 24.dp))
+                    item {
+                        Text("Final kupon · uzman taraması tamamlandı", color = Green, fontWeight = FontWeight.Bold, fontSize = 10.sp)
+                        Text("Not: 6’lı Ganyan, TJK’ya göre aynı gün belirlenen 6 koşunun birincilerini bulma oyunudur. Kuponlar tahmindir; kombinasyon sayısı seçilen at adetlerinin çarpımıdır.", color = Muted, fontSize = 10.sp, modifier = Modifier.padding(bottom = 24.dp))
+                    }
                 }
             }
         }
@@ -1890,7 +1928,7 @@ private fun TopHeader(onRefresh: () -> Unit, refreshing: Boolean, onHistory: () 
                 Image(
                     painter = painterResource(id = R.drawable.two_horse_logo),
                     contentDescription = "Two Horse",
-                    contentScale = ContentScale.FillBounds,
+                    contentScale = ContentScale.Fit,
                     modifier = Modifier.fillMaxSize().clip(RoundedCornerShape(16.dp))
                 )
             }

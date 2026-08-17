@@ -1,0 +1,7 @@
+Two Horse v5.8 FINAL
+- v5.7 full package preserved.
+- 6'li coupon screen now waits for the current expert refresh cycle to finish before presenting FINAL coupons.
+- While expert sites are scanning, the 6'li page shows a blue loading indicator and does not label partial data as final.
+- When expert loading completes, Dar / Dengeli / En Risksiz coupons are rebuilt automatically from the latest Predictor outputs.
+- Any refresh cycle (manual refresh / foreground refresh already wired in v5.7) sets expertsRefreshing again, so the 6'li page waits and then recomputes automatically.
+- Expert ranking consistency and centered logo fixes from v5.7 retained.
