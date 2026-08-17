@@ -1461,6 +1461,7 @@ fun TwoHorseApp() {
         var sixliOpen by remember { mutableStateOf(false) }
         var selectedHistory by remember { mutableStateOf<HistorySnapshot?>(null) }
         var expertRefreshToken by remember { mutableIntStateOf(0) }
+        var expertScanCycle by remember { mutableIntStateOf(0) }
         val scope = rememberCoroutineScope()
         val activity = LocalContext.current as? ComponentActivity
 
@@ -1473,7 +1474,9 @@ fun TwoHorseApp() {
                 val result = runCatching { TjkRepository.loadToday() }
                 val fresh = result.getOrDefault(emptyList())
                 if (fresh.isNotEmpty()) {
-                    meetings = fresh
+                    // Aynı program yeniden geldiyse state'i gereksiz değiştirme. Böylece uzman taraması
+                    // cache -> canlı TJK geçişinde sebepsiz iptal/restart olmaz ve yeşil tik erken yanıp sönmez.
+                    if (fresh != meetings) meetings = fresh
                     MeetingCache.save(context, fresh)
                 } else if (meetings.isEmpty()) {
                     error = result.exceptionOrNull()?.message ?: "Türkiye programı bulunamadı."
@@ -1508,6 +1511,7 @@ fun TwoHorseApp() {
 
         LaunchedEffect(meetings, expertRefreshToken) {
             if (meetings.isNotEmpty()) {
+                val myCycle = ++expertScanCycle
                 expertsRefreshing = true
                 try {
                     // Yeni TJK programı geldiyse bile önce aynı günün uzman cache'ini göster.
@@ -1527,9 +1531,17 @@ fun TwoHorseApp() {
                     expertSignals = loadedExperts
                     withContext(Dispatchers.IO) { HistoryStore.capture(context, meetings, loadedExperts) }
                 } finally {
-                    expertsRefreshing = false
+                    // Eski bir tarama yeni TJK verisi/manuel refresh yüzünden iptal edildiyse onun finally'si
+                    // yeni taramayı "bitti" diye işaretlemesin. Kısa gecikme replacement cycle'ın başlamasına
+                    // fırsat verir; yalnız en güncel cycle gerçekten tamamlandığında yeşil tik gösterilir.
+                    val finishedCycle = myCycle
+                    scope.launch {
+                        delay(150)
+                        if (expertScanCycle == finishedCycle) expertsRefreshing = false
+                    }
                 }
             } else {
+                expertScanCycle++
                 expertsRefreshing = false
             }
         }
