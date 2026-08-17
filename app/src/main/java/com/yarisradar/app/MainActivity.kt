@@ -117,6 +117,7 @@ data class ExpertHorseSignal(
     val totalSources: Int = 0,
     val sources: List<String> = emptyList(),
     val strongSupport: Int = 0,
+    val favoriteBankoSupport: Int = 0,
     val surpriseSupport: Int = 0,
     val negativeSupport: Int = 0,
     val sahaScore: Int = 0,
@@ -144,6 +145,7 @@ data class Pick(
     val expertTotal: Int = 0,
     val expertSources: List<String> = emptyList(),
     val expertStrong: Int = 0,
+    val expertFavoriteBanko: Int = 0,
     val expertSurprise: Int = 0,
     val expertNegative: Int = 0,
     val sahaScore: Int = 0,
@@ -167,8 +169,8 @@ object VideoRepository {
     }
 
     suspend fun loadLast3(startUrl: String): List<RaceVideo> = withContext(Dispatchers.IO) {
-        withTimeoutOrNull(9000) {
-            suspend fun fetch(url: String): Document? = runCatching {
+        withTimeoutOrNull(10000) {
+            fun fetch(url: String): Document? = runCatching {
                 val req = okhttp3.Request.Builder().url(url)
                     .header("User-Agent", "Mozilla/5.0 (Linux; Android 15; Mobile) AppleWebKit/537.36 Chrome/140 Mobile Safari/537.36")
                     .header("Accept-Language", "tr-TR,tr;q=0.9")
@@ -178,31 +180,42 @@ object VideoRepository {
                 }
             }.getOrNull()
 
-            fun videoLinks(doc: Document): List<RaceVideo> = doc.select("a[href]").mapNotNull { a ->
+            fun anchorLabel(a: org.jsoup.nodes.Element): String {
+                val own = a.text().replace(Regex("\s+"), " ").trim()
+                if (own.contains("Koşu", true) && Regex("\b\d{2}[./]\d{2}[./]\d{4}\b").containsMatchIn(own)) return own
+                val row = a.closest("tr")?.text()?.replace(Regex("\s+"), " ")?.trim().orEmpty()
+                if (row.contains("Koşu", true) && Regex("\b\d{2}[./]\d{2}[./]\d{4}\b").containsMatchIn(row)) return row
+                val parent = a.parent()?.text()?.replace(Regex("\s+"), " ")?.trim().orEmpty()
+                return parent
+            }
+
+            fun archiveLinks(doc: Document): List<RaceVideo> = doc.select("a[href]").mapNotNull { a ->
                 val href = a.attr("abs:href").ifBlank { a.attr("href") }
-                if (!href.contains("YarisVideoAt", true)) return@mapNotNull null
-                val raw = a.text().replace(Regex("\\s+"), " ").trim()
-                // Menü linkleri de aynı route'u kullanabiliyor (English, TJK, Günlük Bilgiler).
-                // Yalnız gerçek bir geçmiş koşuyu tarif eden satırları kabul et.
-                val looksLikeRace = raw.contains("Koşu", ignoreCase = true) &&
-                    Regex("\\b\\d{2}[./]\\d{2}[./]\\d{4}\\b").containsMatchIn(raw)
+                if (!href.contains("YarisVideoAt", true) || !href.contains("KosuKodu", true)) return@mapNotNull null
+                val label = anchorLabel(a)
+                val looksLikeRace = label.contains("Koşu", ignoreCase = true) &&
+                    Regex("\b\d{2}[./]\d{2}[./]\d{4}\b").containsMatchIn(label)
                 if (!looksLikeRace) return@mapNotNull null
-                RaceVideo(raw, href)
+                RaceVideo(label, href)
             }.distinctBy { it.url }
 
-
             val firstDoc = fetch(startUrl) ?: return@withTimeoutOrNull emptyList()
-            var links = videoLinks(firstDoc)
-            if (!startUrl.contains("YarisVideoAt", true)) {
-                val archive = links.firstOrNull()?.url
-                if (archive != null) {
-                    val archiveDoc = fetch(archive)
-                    if (archiveDoc != null) links = videoLinks(archiveDoc).ifEmpty { links }
-                }
-            }
-            links.take(3)
+            val archiveUrl = if (startUrl.contains("YarisVideoAt", true)) {
+                startUrl
+            } else {
+                firstDoc.select("a[href*='YarisVideoAt'][href*='AtKodu'][href*='KosuKodu']")
+                    .map { it.attr("abs:href").ifBlank { it.attr("href") } }
+                    .firstOrNull { it.startsWith("http") }
+            } ?: return@withTimeoutOrNull emptyList()
+
+            val archiveDoc = if (archiveUrl == startUrl) firstDoc else fetch(archiveUrl) ?: return@withTimeoutOrNull emptyList()
+            val currentKosu = Regex("[?&]KosuKodu=([^&]+)").find(archiveUrl)?.groupValues?.getOrNull(1)
+            archiveLinks(archiveDoc)
+                .filterNot { v -> currentKosu != null && v.url.contains("KosuKodu=$currentKosu") }
+                .take(3)
         } ?: emptyList()
     }
+
 }
 
 data class HistorySnapshot(val race: Race, val picks: List<Pick>)
@@ -223,10 +236,12 @@ object HistoryStore {
         val root = if (prefs.getString(KEY_DATE, null) == day) {
             runCatching { JSONObject(prefs.getString(KEY_DATA, "{}") ?: "{}") }.getOrDefault(JSONObject())
         } else JSONObject()
+        val now = System.currentTimeMillis()
         meetings.flatMap { it.races }.forEach { race ->
             val key = raceKey(race)
-            // Snapshot is immutable: once captured, later odds/results cannot rewrite the old prediction.
-            if (!root.has(key)) {
+            // Yalnız yarış başlamadan önce snapshot al. Uygulama yarıştan sonra ilk kez açılırsa
+            // o koşu için sonradan "tahmin üretmiş" gibi history oluşturma.
+            if (!root.has(key) && secondsUntil(race.time, now) > 0L) {
                 val picks = Predictor.picks(race, experts[key])
                 if (picks.isNotEmpty()) root.put(key, snapshotToJson(HistorySnapshot(race, picks)))
             }
@@ -254,10 +269,10 @@ object HistoryStore {
     private fun raceFromJson(o:JSONObject):Race { val a=o.getJSONArray("horses"); val hs=(0 until a.length()).map{horseFromJson(a.getJSONObject(it))}; return Race(o.getInt("number"),o.getString("time"),o.optString("title"),o.optString("distance"),o.optString("surface"),hs,o.optString("city")) }
     private fun pickToJson(p:Pick)=JSONObject().apply {
         put("horse",horseToJson(p.horse));put("score",p.score);put("label",p.label);put("reasons",JSONArray(p.reasons)); p.agfRank?.let{put("agfRank",it)};p.hpRank?.let{put("hpRank",it)};p.expertRank?.let{put("expertRank",it)}
-        put("expertSupport",p.expertSupport);put("expertTotal",p.expertTotal);put("expertSources",JSONArray(p.expertSources));put("expertStrong",p.expertStrong);put("expertSurprise",p.expertSurprise);put("expertNegative",p.expertNegative);put("sahaScore",p.sahaScore);put("sahaNotes",JSONArray(p.sahaNotes));put("marketLabel",p.marketLabel);put("formLabel",p.formLabel)
+        put("expertSupport",p.expertSupport);put("expertTotal",p.expertTotal);put("expertSources",JSONArray(p.expertSources));put("expertStrong",p.expertStrong);put("expertFavoriteBanko",p.expertFavoriteBanko);put("expertSurprise",p.expertSurprise);put("expertNegative",p.expertNegative);put("sahaScore",p.sahaScore);put("sahaNotes",JSONArray(p.sahaNotes));put("marketLabel",p.marketLabel);put("formLabel",p.formLabel)
     }
     private fun strings(a:JSONArray)= (0 until a.length()).map{a.optString(it)}
-    private fun pickFromJson(o:JSONObject)=Pick(horseFromJson(o.getJSONObject("horse")),o.getInt("score"),o.getString("label"),strings(o.getJSONArray("reasons")),o.optIntN("agfRank"),o.optIntN("hpRank"),o.optIntN("expertRank"),o.optInt("expertSupport"),o.optInt("expertTotal"),strings(o.optJSONArray("expertSources")?:JSONArray()),o.optInt("expertStrong"),o.optInt("expertSurprise"),o.optInt("expertNegative"),o.optInt("sahaScore"),strings(o.optJSONArray("sahaNotes")?:JSONArray()),o.optString("marketLabel","Belirsiz"),o.optString("formLabel","→ Dengeli"))
+    private fun pickFromJson(o:JSONObject)=Pick(horseFromJson(o.getJSONObject("horse")),o.getInt("score"),o.getString("label"),strings(o.getJSONArray("reasons")),o.optIntN("agfRank"),o.optIntN("hpRank"),o.optIntN("expertRank"),o.optInt("expertSupport"),o.optInt("expertTotal"),strings(o.optJSONArray("expertSources")?:JSONArray()),o.optInt("expertStrong"),o.optInt("expertFavoriteBanko"),o.optInt("expertSurprise"),o.optInt("expertNegative"),o.optInt("sahaScore"),strings(o.optJSONArray("sahaNotes")?:JSONArray()),o.optString("marketLabel","Belirsiz"),o.optString("formLabel","→ Dengeli"))
     private fun snapshotToJson(s:HistorySnapshot)=JSONObject().apply{put("race",raceToJson(s.race));put("picks",JSONArray().apply{s.picks.forEach{put(pickToJson(it))}})}
     private fun snapshotFromJson(o:JSONObject):HistorySnapshot { val a=o.getJSONArray("picks"); return HistorySnapshot(raceFromJson(o.getJSONObject("race")),(0 until a.length()).map{pickFromJson(a.getJSONObject(it))}) }
     private fun JSONObject.optIntN(k:String):Int?=if(has(k)&&!isNull(k)) getInt(k) else null
@@ -487,39 +502,45 @@ object ExpertRepository {
                     meeting.races.forEach { race ->
                         val supports = mutableMapOf<Int, MutableList<String>>()
                         val strongs = mutableMapOf<Int, MutableList<String>>()
+                        val favoriteBankos = mutableMapOf<Int, MutableList<String>>()
                         val surprises = mutableMapOf<Int, MutableList<String>>()
                         val negatives = mutableMapOf<Int, MutableList<String>>()
                         val sahaScores = mutableMapOf<Int, Int>()
                         val sahaNotes = mutableMapOf<Int, MutableList<String>>()
                         val validNos = race.horses.map { it.no }.toSet()
-                        docs.forEach { doc ->
-                            val raceText = raceSection(doc.text, race.number)
+                        val validatedDocs = docs.mapNotNull { doc ->
+                            validatedRaceSection(doc.text, race, meeting.races.size)?.let { section -> doc to section }
+                        }
+                        supports.clear(); strongs.clear(); favoriteBankos.clear(); surprises.clear(); negatives.clear(); sahaScores.clear(); sahaNotes.clear()
+                        validatedDocs.forEach { (doc, raceText) ->
                             race.horses.forEach { horse ->
                                 val signal = analyzeHorseText(raceText, horse, validNos)
                                 val positive = if (doc.source.strongOnly) signal.strong else signal.positive
                                 if (positive && !signal.negative) supports.getOrPut(horse.no) { mutableListOf() }.add(doc.source.name)
                                 if (signal.strong && !signal.negative) strongs.getOrPut(horse.no) { mutableListOf() }.add(doc.source.name)
+                                if (signal.favoriteBanko && !signal.negative) favoriteBankos.getOrPut(horse.no) { mutableListOf() }.add(doc.source.name)
                                 if (signal.surprise && !signal.negative) surprises.getOrPut(horse.no) { mutableListOf() }.add(doc.source.name)
                                 if (signal.negative) negatives.getOrPut(horse.no) { mutableListOf() }.add(doc.source.name)
                                 if (signal.sahaScore != 0) sahaScores[horse.no] = (sahaScores[horse.no] ?: 0) + signal.sahaScore
                                 if (signal.sahaNotes.isNotEmpty()) sahaNotes.getOrPut(horse.no) { mutableListOf() }.addAll(signal.sahaNotes)
                             }
                         }
-                        val freshCount = docs.count { it.fresh }
-                        val cachedCount = docs.size - freshCount
+                        val freshCount = validatedDocs.count { it.first.fresh }
+                        val cachedCount = validatedDocs.size - freshCount
                         put(raceKey(race), RaceExpertSignal(
-                            sourceCount = docs.size,
+                            sourceCount = validatedDocs.size,
                             configuredSourceCount = sources.size,
                             freshSourceCount = freshCount,
                             cachedSourceCount = cachedCount,
-                            activeSources = docs.map { it.source.name },
+                            activeSources = validatedDocs.map { it.first.source.name },
                             byHorse = race.horses.associate { horse ->
                                 val src = supports[horse.no].orEmpty().distinct()
                                 horse.no to ExpertHorseSignal(
                                     support = src.size,
-                                    totalSources = docs.size,
+                                    totalSources = validatedDocs.size,
                                     sources = src,
                                     strongSupport = strongs[horse.no].orEmpty().distinct().size,
+                                    favoriteBankoSupport = favoriteBankos[horse.no].orEmpty().distinct().size,
                                     surpriseSupport = surprises[horse.no].orEmpty().distinct().size,
                                     negativeSupport = negatives[horse.no].orEmpty().distinct().size,
                                     sahaScore = sahaScores[horse.no] ?: 0,
@@ -598,20 +619,64 @@ object ExpertRepository {
         return hasCity && dateSignals >= 1 && hasRaceLanguage
     }
 
-    private fun raceSection(text: String, raceNo: Int): String {
-        val patterns = listOf("$raceNo kosu", "$raceNo. kosu", "${raceNo}kosu", "${raceNo} kosu olan")
-        val starts = patterns.map { text.indexOf(it) }.filter { it >= 0 }
-        if (starts.isEmpty()) return text
-        val start = starts.minOrNull() ?: 0
-        val next = (raceNo + 1)
-        val ends = listOf("$next kosu", "$next. kosu", "${next}kosu").map { text.indexOf(it, start + 4) }.filter { it > start }
-        val end = ends.minOrNull() ?: min(text.length, start + 4500)
-        return text.substring(start, end)
+    private fun validatedRaceSection(text: String, race: Race, totalRaces: Int): String? {
+        val raceNo = race.number
+        val explicitPatterns = listOf("$raceNo kosu", "$raceNo. kosu", "${raceNo}kosu", "${raceNo} kosu olan")
+        val explicitStarts = explicitPatterns.map { text.indexOf(it) }.filter { it >= 0 }
+        if (explicitStarts.isNotEmpty()) {
+            val start = explicitStarts.minOrNull() ?: 0
+            val next = raceNo + 1
+            val ends = listOf("$next kosu", "$next. kosu", "${next}kosu")
+                .map { text.indexOf(it, start + 4) }.filter { it > start }
+            val end = ends.minOrNull() ?: min(text.length, start + 4200)
+            val section = text.substring(start, end)
+            if (sectionHasRaceSignal(section, race)) return section
+        }
+
+        // Bazı tahmin siteleri koşu numarası yerine 1.AYAK/2.AYAK kullanıyor.
+        // 2. altılının başlangıç koşusunu sayfadan bulup ayak -> koşu eşlemesi yap.
+        val secondStart = Regex("2\.?\s*altili(?:\s*ganyan)?(?:\s*tahmin)?[^0-9]{0,80}(\d{1,2})\.?\s*kosu")
+            .find(text)?.groupValues?.getOrNull(1)?.toIntOrNull()
+        val firstStart = if (secondStart != null) max(1, secondStart - 6) else max(1, totalRaces - 11)
+        val useSecond = secondStart != null && raceNo >= secondStart
+        val blockLabel = if (useSecond) "2 altili" else "1 altili"
+        val blockStart = text.indexOf(blockLabel)
+        if (blockStart >= 0) {
+            val otherLabel = if (useSecond) "yedili" else "2 altili"
+            val blockEndFound = text.indexOf(otherLabel, blockStart + blockLabel.length)
+            val blockEnd = if (blockEndFound > blockStart) blockEndFound else min(text.length, blockStart + 7000)
+            val block = text.substring(blockStart, blockEnd)
+            val leg = if (useSecond) raceNo - (secondStart ?: raceNo) + 1 else raceNo - firstStart + 1
+            if (leg in 1..6) {
+                val legPatterns = listOf("$leg ayak", "$leg. ayak", "${leg}ayak")
+                val legStarts = legPatterns.map { block.indexOf(it) }.filter { it >= 0 }
+                if (legStarts.isNotEmpty()) {
+                    val ls = legStarts.minOrNull() ?: 0
+                    val nextLeg = leg + 1
+                    val le = listOf("$nextLeg ayak", "$nextLeg. ayak", "${nextLeg}ayak")
+                        .map { block.indexOf(it, ls + 3) }.filter { it > ls }.minOrNull() ?: min(block.length, ls + 900)
+                    val section = block.substring(ls, le)
+                    if (sectionHasRaceSignal(section, race)) return section
+                }
+            }
+        }
+        return null
+    }
+
+    private fun sectionHasRaceSignal(section: String, race: Race): Boolean {
+        val horseNames = race.horses.count { h -> normalize(h.name).length >= 4 && section.contains(normalize(h.name)) }
+        if (horseNames >= 1) return true
+        val validNos = race.horses.map { it.no }.toSet()
+        val nums = Regex("\b\d{1,2}\b").findAll(section).mapNotNull { it.value.toIntOrNull() }
+            .filter { it in validNos }.toSet()
+        val hasTipLanguage = listOf("ayak", "favori", "banko", "tek", "rakip", "surpriz", "plase", "tahmin").any { section.contains(it) }
+        return hasTipLanguage && nums.isNotEmpty()
     }
 
     private data class ParsedHorseText(
         val positive: Boolean = false,
         val strong: Boolean = false,
+        val favoriteBanko: Boolean = false,
         val surprise: Boolean = false,
         val negative: Boolean = false,
         val sahaScore: Int = 0,
@@ -620,12 +685,14 @@ object ExpertRepository {
 
     private fun analyzeHorseText(text: String, horse: Horse, validNos: Set<Int>): ParsedHorseText {
         val needle = normalize(horse.name)
-        val strongWords = listOf("banko", "tek", "favori", "ilk sans", "ilk atim", "birinci sans", "gunun teki")
+        val favoriteBankoWords = listOf("banko", "tek", "favori", "favorim", "gunun teki", "gunun bankosu", "bankom")
+        val strongWords = (favoriteBankoWords + listOf("ilk sans", "ilk atim", "birinci sans", "cok sansli", "en sansli")).distinct()
         val positiveWords = listOf("rakip", "ihmal edilmemeli", "oner", "sansli", "aday", "plase", "degerlendir", "kazanabilir")
         val surpriseWords = listOf("surpriz", "supriz", "bomba", "bombasi", "ters")
         val negativeWords = listOf("gelmez", "yazmam", "onermiyorum", "onermem", "sansini az", "sansi az", "sans vermiyorum", "dusunmuyorum", "yetersiz", "elenir", "elerim", "elemem")
 
         var directStrong = false
+        var directFavoriteBanko = false
         var directPositive = false
         var directSurprise = false
         var directNegative = false
@@ -644,6 +711,7 @@ object ExpertRepository {
                     .split(Regex("[.!?;|\n]") )
                     .firstOrNull { it.contains(needle) }
                     ?: snippet
+                directFavoriteBanko = directFavoriteBanko || favoriteBankoWords.any { local.contains(it) }
                 directStrong = directStrong || strongWords.any { local.contains(it) } || Regex("★{3,5}").containsMatchIn(local)
                 directSurprise = directSurprise || surpriseWords.any { local.contains(it) }
                 directPositive = directPositive || directStrong || directSurprise || positiveWords.any { local.contains(it) }
@@ -667,15 +735,17 @@ object ExpertRepository {
             }
         }
 
+        val listFavoriteBanko = numberRecommendation(text, horse.no, validNos, favoriteBankoWords)
         val listStrong = numberRecommendation(text, horse.no, validNos, strongWords)
         val listPositive = numberRecommendation(text, horse.no, validNos, positiveWords)
         val listSurprise = numberRecommendation(text, horse.no, validNos, surpriseWords)
         val listNegative = numberRecommendation(text, horse.no, validNos, negativeWords)
         val negative = directNegative || listNegative
-        val strong = directStrong || listStrong
+        val favoriteBanko = directFavoriteBanko || listFavoriteBanko
+        val strong = directStrong || listStrong || favoriteBanko
         val surprise = directSurprise || listSurprise
         val positive = directPositive || listPositive || strong || surprise
-        return ParsedHorseText(positive, strong, surprise, negative, saha.coerceIn(-4, 6), notes.distinct())
+        return ParsedHorseText(positive, strong, favoriteBanko, surprise, negative, saha.coerceIn(-4, 6), notes.distinct())
     }
 
     private fun numberRecommendation(text: String, horseNo: Int, validNos: Set<Int>, labels: List<String>): Boolean {
@@ -1044,7 +1114,10 @@ object Predictor {
         fun support(h: Horse): ExpertHorseSignal = expert?.byHorse?.get(h.no) ?: ExpertHorseSignal(totalSources = expert?.sourceCount ?: 0)
         fun expertRank(h: Horse): Int? {
             if ((expert?.sourceCount ?: 0) <= 0) return null
-            val ordered = race.horses.map { it.no to support(it).support }.sortedByDescending { it.second }
+            if (support(h).support <= 0) return null
+            val ordered = race.horses.map { it.no to support(it).support }
+                .filter { it.second > 0 }
+                .sortedByDescending { it.second }
             return ordered.indexOfFirst { it.first == h.no }.takeIf { it >= 0 }?.plus(1)
         }
         fun formScore(last6: String): Double {
@@ -1077,11 +1150,11 @@ object Predictor {
             }
 
             h.agf?.let {
-                addComponent(it.toDouble() / maxAgf, 25.0)
+                addComponent(it.toDouble() / maxAgf, 30.0)
                 if (it >= 18) reasons += "AGF desteği yüksek"
             }
             h.hp?.let {
-                addComponent(it.toDouble() / maxHp, 15.0)
+                addComponent(it.toDouble() / maxHp, 10.0)
                 if (it >= maxHp - 5) reasons += "HP gruba göre güçlü"
             }
             h.weight?.let { w ->
@@ -1094,7 +1167,7 @@ object Predictor {
                 if (o <= minOdds * 1.6) reasons += "piyasa desteği"
             }
             val fScore = formScore(h.last6)
-            if (h.last6.isNotBlank()) addComponent(fScore / maxFormScore, 18.0)
+            if (h.last6.isNotBlank()) addComponent(fScore / maxFormScore, 15.0)
             if (formLabel(h.last6).contains("Yükseliyor") || formLabel(h.last6).contains("Formda")) reasons += "yakın formu olumlu"
             if (h.best.isNotBlank()) reasons += "pist/mesafe derecesi var"
 
@@ -1102,16 +1175,20 @@ object Predictor {
             if (ex.totalSources > 0) {
                 val ratio = ex.support.toDouble() / ex.totalSources
                 val strongRatio = ex.strongSupport.toDouble() / ex.totalSources
+                val favoriteBankoRatio = ex.favoriteBankoSupport.toDouble() / ex.totalSources
                 val surpriseRatio = ex.surpriseSupport.toDouble() / ex.totalSources
                 val negativeRatio = ex.negativeSupport.toDouble() / ex.totalSources
-                val expertValue = (ratio * .62 + strongRatio * .28 + surpriseRatio * .08 - negativeRatio * .38).coerceIn(0.0, 1.0)
-                addComponent(expertValue, 22.0)
+                // Favori/banko/tek, güçlü desteğin bir alt kümesidir. Aynı siteyi iki tam oy gibi
+                // saymıyoruz; açık favori/banko ifadesi güçlü desteğe küçük bir ek bonus verir.
+                val expertValue = (ratio * .54 + strongRatio * .25 + favoriteBankoRatio * .15 + surpriseRatio * .06 - negativeRatio * .38).coerceIn(0.0, 1.0)
+                addComponent(expertValue, 25.0)
                 if (ex.sahaNotes.isNotEmpty()) {
                     val sahaValue = ((ex.sahaScore.coerceIn(-4, 6) + 4).toDouble() / 10.0)
                     addComponent(sahaValue, 5.0)
                 }
                 if (ex.support > 0) reasons += "uzman desteği ${ex.support}/${ex.totalSources}"
                 if (ex.strongSupport > 0) reasons += "${ex.strongSupport} güçlü uzman sinyali"
+                if (ex.favoriteBankoSupport > 0) reasons += "⭐ ${ex.favoriteBankoSupport} favori/banko sinyali"
                 if (ex.negativeSupport > 0) reasons += "${ex.negativeSupport} olumsuz uzman görüşü"
                 if (ex.sahaNotes.isNotEmpty()) reasons += ex.sahaNotes.first()
             }
@@ -1163,6 +1240,7 @@ object Predictor {
                 expertTotal = ex.totalSources,
                 expertSources = ex.sources,
                 expertStrong = ex.strongSupport,
+                expertFavoriteBanko = ex.favoriteBankoSupport,
                 expertSurprise = ex.surpriseSupport,
                 expertNegative = ex.negativeSupport,
                 sahaScore = ex.sahaScore,
@@ -1362,7 +1440,7 @@ private fun HistoryScreen(snapshots: List<HistorySnapshot>, onBack: () -> Unit, 
 private fun HistoryDetail(snapshot: HistorySnapshot, onBack: () -> Unit) {
     val race=snapshot.race
     Column(Modifier.fillMaxSize().statusBarsPadding()) {
-        Row(Modifier.fillMaxWidth().padding(8.dp),verticalAlignment=Alignment.CenterVertically){IconButton(onClick=onBack){Icon(Icons.Default.ArrowBack,"Geri")};Column{Text("${race.city} · ${race.number}. Koşu",fontWeight=FontWeight.Black,fontSize=20.sp);Text("Yarış öncesi kaydedilmiş analiz · yeniden hesaplanmadı",color=Muted,fontSize=10.sp)}}
+        Row(Modifier.fillMaxWidth().padding(8.dp),verticalAlignment=Alignment.CenterVertically){IconButton(onClick=onBack){Icon(Icons.Default.ArrowBack,"Geri")};Column{Text("${race.city} · ${race.number}. Koşu",fontWeight=FontWeight.Black,fontSize=20.sp);Text("Yarış öncesi kaydedilmiş analiz",color=Muted,fontSize=10.sp)}}
         LazyColumn(Modifier.fillMaxSize(),contentPadding=PaddingValues(18.dp),verticalArrangement=Arrangement.spacedBy(10.dp)){
             item { Text("Kayıtlı sıralama",fontWeight=FontWeight.Black,fontSize=18.sp) }
             items(snapshot.picks){ HorseCard(it) }
@@ -1677,13 +1755,6 @@ fun RaceDetail(race: Race, expert: RaceExpertSignal?, onBack: () -> Unit) {
                 CouponRow("Geniş", picks.take(min(5, picks.size)).joinToString(" – ") { it.horse.no.toString() }, "Sürpriz koruması")
             }
         }
-        item {
-            Text(
-                "Güven puanı; AGF %25, HP %15, form %18, uzman %22, ganyan/piyasa %10, kilo %5 ve saha %5 ağırlıklarıyla hesaplanır. Eksik veri varsa o bileşen atı otomatik cezalandırmaz; mevcut bileşenlerin ağırlığı yeniden dengelenir. Uzman siteleri yanıt vermezse uygulama onları beklemeden TJK verisiyle çalışmaya devam eder. Tahmin garanti değildir.",
-                color = Muted,
-                fontSize = 11.sp
-            )
-        }
     }
 }
 
@@ -1701,7 +1772,7 @@ private fun ExpertStatusCard(expert: RaceExpertSignal?) {
         Column(Modifier.fillMaxWidth().padding(13.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Text("Uzman verisi", fontWeight = FontWeight.Black, fontSize = 12.sp, color = Ink, modifier = Modifier.weight(1f))
-                Text("$available/$configured kaynak aktif", color = if (available > 0) Green else Muted, fontWeight = FontWeight.Bold, fontSize = 11.sp)
+                Text("$available/$configured site aktif", color = if (available > 0) Green else Muted, fontWeight = FontWeight.Bold, fontSize = 11.sp)
             }
             if (available > 0) {
                 Spacer(Modifier.height(4.dp))
@@ -1744,8 +1815,9 @@ private fun ResultHero(favorite: Pick, rival: Pick?, surprise: Pick?) {
                 if (favorite.expertTotal > 0) {
                     val rank = favorite.expertRank?.let { "#$it · " }.orEmpty()
                     buildString {
-                        append("$rank${favorite.expertSupport}/${favorite.expertTotal} kaynak")
-                        if (favorite.expertStrong > 0) append(" · ${favorite.expertStrong} güçlü")
+                        append("${rank}Destek ${favorite.expertSupport}/${favorite.expertTotal}")
+                        if (favorite.expertStrong > 0) append(" · Güçlü ${favorite.expertStrong}/${favorite.expertTotal}")
+                        if (favorite.expertFavoriteBanko > 0) append(" · ⭐ ${favorite.expertFavoriteBanko}/${favorite.expertTotal} Favori/Banko")
                         if (favorite.expertSurprise > 0) append(" · ${favorite.expertSurprise} sürpriz")
                         if (favorite.expertNegative > 0) append(" · ${favorite.expertNegative} olumsuz")
                     }
@@ -1843,8 +1915,9 @@ private fun HorseCard(p: Pick) {
                 DetailMetric(
                     "Uzman",
                     if (p.expertTotal > 0) buildString {
-                        append("${p.expertRank?.let { "#$it · " }.orEmpty()}${p.expertSupport}/${p.expertTotal}")
-                        if (p.expertStrong > 0) append(" · ${p.expertStrong} güçlü")
+                        append("${p.expertRank?.let { "#$it · " }.orEmpty()}Destek ${p.expertSupport}/${p.expertTotal}")
+                        if (p.expertStrong > 0) append(" · Güçlü ${p.expertStrong}/${p.expertTotal}")
+                        if (p.expertFavoriteBanko > 0) append(" · ⭐ ${p.expertFavoriteBanko}/${p.expertTotal} Favori/Banko")
                         if (p.expertSurprise > 0) append(" · ${p.expertSurprise} sürpriz")
                         if (p.expertNegative > 0) append(" · ${p.expertNegative} olumsuz")
                     } else "—"
@@ -1869,14 +1942,7 @@ private fun HorseCard(p: Pick) {
                                     val found = VideoRepository.loadLast3(videoUrl)
                                     videos = found
                                     videoLoading = false
-                                    if (found.isEmpty()) {
-                                        // TJK sayfası satır linklerini HTML'de açık href olarak vermiyorsa,
-                                        // kullanıcıyı tek ve temiz şekilde resmi arşive götür.
-                                        runCatching { context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(videoUrl))) }
-                                        videoExpanded = false
-                                    } else {
-                                        videoExpanded = true
-                                    }
+                                    videoExpanded = true
                                 }
                             }
                         },
@@ -1893,7 +1959,7 @@ private fun HorseCard(p: Pick) {
                     }
                     if (videoExpanded) {
                         if (videos.isEmpty() && !videoLoading) {
-                            Text("Video listesi TJK arşivinde açılır.", color = Muted, fontSize = 9.sp)
+                            Text("Bu at için oynatılabilir geçmiş yarış videosu bulunamadı.", color = Muted, fontSize = 9.sp)
                         } else {
                             videos.take(3).forEachIndexed { index, video ->
                                 TextButton(
