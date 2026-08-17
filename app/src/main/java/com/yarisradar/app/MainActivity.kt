@@ -734,7 +734,7 @@ object ExpertRepository {
     private fun sectionQuality(section: String, race: Race): Int {
         val horseNames = race.horses.count { h -> normalize(h.name).length >= 4 && section.contains(normalize(h.name)) }
         val validNos = race.horses.map { it.no }.toSet()
-        val nums = Regex("\b\d{1,2}\b").findAll(section).mapNotNull { it.value.toIntOrNull() }.filter { it in validNos }.toSet().size
+        val nums = Regex("\\b\\d{1,2}\\b").findAll(section).mapNotNull { it.value.toIntOrNull() }.filter { it in validNos }.toSet().size
         val tipCount = listOf("favori", "banko", "tek", "rakip", "surpriz", "plase", "tahmin", "ayak").count { section.contains(it) }
         return horseNames * 8 + nums * 2 + tipCount
     }
@@ -742,7 +742,7 @@ object ExpertRepository {
     private fun sectionHasRaceSignal(section: String, race: Race): Boolean {
         val horseNames = race.horses.count { h -> normalize(h.name).length >= 4 && section.contains(normalize(h.name)) }
         val validNos = race.horses.map { it.no }.toSet()
-        val nums = Regex("\b\d{1,2}\b").findAll(section).mapNotNull { it.value.toIntOrNull() }
+        val nums = Regex("\\b\\d{1,2}\\b").findAll(section).mapNotNull { it.value.toIntOrNull() }
             .filter { it in validNos }.toSet()
         val hasTipLanguage = listOf("ayak", "favori", "banko", "tek", "rakip", "surpriz", "plase", "tahmin").any { section.contains(it) }
         return horseNames >= 1 || (hasTipLanguage && nums.size >= 2)
