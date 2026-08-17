@@ -1,0 +1,11 @@
+Two Horse 5.9 FINAL AUDIT
+
+- TJK video archive: true date-descending last 3; no longer drops newest link because start URL KosuKodu was mistaken for current race.
+- Expert parser isolation: preserves page line boundaries and restricts horse context to prevent adjacent horse comments leaking.
+- Favorite/Banko number parsing tightened; generic nearby numbers no longer receive stars.
+- Expert ranking hierarchy: Favorite/Banko > Strong > Support > Surprise; negatives penalized.
+- Added Yabanci Ganyan as an eighth expert source.
+- Expert cache namespace bumped to v3 so stale parser-era cache cannot keep false stars.
+- History capture runs independently every 15 sec and updates live; History screen reloads store while open.
+- History UI now shows compact race cards and the saved pre-race hero/ranking detail.
+- Previous 5.8.1 scan-completion status, 30s per-source timeout, cache-first UI, foreground refresh, sixli and all earlier fixes retained.

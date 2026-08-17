@@ -24,6 +24,8 @@ import androidx.compose.material.icons.filled.KeyboardArrowDown
 import androidx.compose.material.icons.filled.KeyboardArrowUp
 import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.Refresh
+import androidx.compose.material.icons.filled.History
+import androidx.compose.material.icons.filled.KeyboardArrowRight
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Stars
 import androidx.compose.material3.*
@@ -181,6 +183,9 @@ object VideoRepository {
             .build()
     }
 
+    private fun normalizeVideoLabel(v: String): String = v.lowercase(Locale.forLanguageTag("tr-TR"))
+        .replace("ı", "i").replace("ş", "s").replace("ğ", "g").replace("ü", "u").replace("ö", "o").replace("ç", "c")
+
     suspend fun loadLast3(startUrl: String): List<RaceVideo> = withContext(Dispatchers.IO) {
         withTimeoutOrNull(10000) {
             fun fetch(url: String): Document? = runCatching {
@@ -222,7 +227,6 @@ object VideoRepository {
             } ?: return@withTimeoutOrNull emptyList()
 
             val archiveDoc = if (archiveUrl == startUrl) firstDoc else fetch(archiveUrl) ?: return@withTimeoutOrNull emptyList()
-            val currentKosu = Regex("[?&]KosuKodu=([^&]+)").find(archiveUrl)?.groupValues?.getOrNull(1)
             fun videoDate(v: RaceVideo): Long {
                 val raw = Regex("\\b(\\d{2})[./](\\d{2})[./](\\d{4})\\b").find(v.label) ?: return 0L
                 val (dd, mm, yyyy) = raw.destructured
@@ -234,8 +238,14 @@ object VideoRepository {
             archiveLinks(archiveDoc)
                 // TJK bazı geçmiş satırlarında "Koşmaz" kaydı da video bağlantısı üretebiliyor; gerçek yarış saymıyoruz.
                 .filterNot { it.label.contains("Koşmaz", ignoreCase = true) }
-                .filterNot { v -> currentKosu != null && v.url.contains("KosuKodu=$currentKosu") }
                 .sortedByDescending(::videoDate)
+                // startUrl TJK'nin at detayindan herhangi bir gecmis kosuya isaret edebilir;
+                // KosuKodu'nu "mevcut kosu" sanip elemek en yeni videoyu kaybettiriyordu.
+                .distinctBy { v ->
+                    val date = Regex("\\b\\d{2}[./]\\d{2}[./]\\d{4}\\b").find(v.label)?.value.orEmpty()
+                    val raceNo = Regex("\\b(\\d{1,2})\\.?\\s*kosu\\b", RegexOption.IGNORE_CASE).find(normalizeVideoLabel(v.label))?.groupValues?.getOrNull(1).orEmpty()
+                    "$date|$raceNo"
+                }
                 .take(3)
         } ?: emptyList()
     }
@@ -408,7 +418,7 @@ object ExpertRepository {
     )
     private data class SourceDoc(val source: Source, val text: String, val fresh: Boolean)
 
-    private const val PREF = "two_horse_expert_cache_v2"
+    private const val PREF = "two_horse_expert_cache_v3"
     private val months = listOf("ocak", "subat", "mart", "nisan", "mayis", "haziran", "temmuz", "agustos", "eylul", "ekim", "kasim", "aralik")
     private val client by lazy {
         okhttp3.OkHttpClient.Builder()
@@ -503,6 +513,17 @@ object ExpertRepository {
                 )
             },
             discoveryPages = { _, _ -> listOf("https://www.puanlibulten.com/", "https://puanlialtilibulten.blogspot.com/") }
+        ),
+        Source(
+            name = "Yabancı Ganyan",
+            candidates = { city, date ->
+                val (d, m, y) = dateParts(date)
+                listOf(
+                    "https://www.yabanciganyan.com/gunluk-analiz/${slug(city)}-at-yarisi-tahminleri-$d-${months[m-1]}-$y/",
+                    "https://www.yabanciganyan.com/?s=${urlEncode("$city $d ${months[m-1]} $y")}"
+                )
+            },
+            discoveryPages = { _, _ -> listOf("https://www.yabanciganyan.com/gunluk-analiz/") }
         )
     )
 
@@ -668,12 +689,12 @@ object ExpertRepository {
         fun tryDoc(url: String): String? {
             if (!attempted.add(url)) return null
             val doc = fetchDocument(url) ?: return null
-            val text = normalizeExpert(doc.body().text())
+            val text = normalizeExpert(doc.body().wholeText())
             if (looksRelevant(text, city, date)) return text
             discoverMatchingLinks(doc, city, date).forEach { discovered ->
                 if (attempted.add(discovered)) {
                     fetchDocument(discovered)?.let { d2 ->
-                        val t2 = normalizeExpert(d2.body().text())
+                        val t2 = normalizeExpert(d2.body().wholeText())
                         if (looksRelevant(t2, city, date)) return t2
                     }
                 }
@@ -842,65 +863,93 @@ object ExpertRepository {
         val notes = mutableListOf<String>()
         var saha = 0
 
-        if (needle.length >= 4) {
-            var start = text.indexOf(needle)
-            while (start >= 0) {
-                // At adının yakınındaki cümle/ifade dışına taşmamaya çalış. Önceki geniş pencere,
-                // başka atlara ait yorumlardaki kelimeleri bu ata yanlış bağlayabiliyordu.
-                val from = max(0, start - 110)
-                val end = min(text.length, start + needle.length + 180)
-                val snippet = text.substring(from, end)
-                val local = snippet
-                    .split(Regex("[.!?;|\n]") )
-                    .firstOrNull { it.contains(needle) }
-                    ?: snippet
-                directFavoriteBanko = directFavoriteBanko || favoriteBankoWords.any { local.contains(it) }
-                directStrong = directStrong || strongWords.any { local.contains(it) } || Regex("★{3,5}").containsMatchIn(local)
-                directSurprise = directSurprise || surpriseWords.any { local.contains(it) }
-                directPositive = directPositive || directStrong || directSurprise || positiveWords.any { local.contains(it) }
-                directNegative = directNegative || negativeWords.any { phrase ->
-                    Regex("(^|[^a-z0-9çğıöşü])" + Regex.escape(phrase) + "([^a-z0-9çğıöşü]|$)").containsMatchIn(local)
-                }
+        // Bir at adinin yorumunu komsu at kartina tasirmamak icin baglami satir/segment sinirinda kes.
+        // Eski +/-180 karakter penceresi, ozellikle uzun bultenlerde bir sonraki atin "banko/favori"
+        // kelimesini onceki ata da baglayabiliyordu.
+        fun localContext(at: Int): String {
+            val leftPipe = text.lastIndexOf('|', at).takeIf { it >= 0 } ?: max(0, at - 120)
+            val rightPipe = text.indexOf('|', at + needle.length).takeIf { it >= 0 } ?: min(text.length, at + needle.length + 160)
+            var from = max(0, leftPipe)
+            var to = min(text.length, rightPipe)
+            // Pipe olmayan eski cache metninde komsu at adina kadar kisalt.
+            raceHorseBoundary@ for (otherNo in validNos) {
+                if (otherNo == horse.no) continue
+                val token = " $otherNo "
+                val pos = text.indexOf(token, at + needle.length)
+                if (pos in (at + needle.length + 1) until to) to = pos
+            }
+            if (to <= from) { from = max(0, at - 90); to = min(text.length, at + needle.length + 120) }
+            return text.substring(from, to)
+        }
 
-                if (listOf("jokeyiyle daha once yaris kazan", "ayni jokeyle daha once kazan", "bu jokeyle daha once kazan").any { snippet.contains(it) }) {
+        if (needle.length >= 4) {
+            var at = text.indexOf(needle)
+            while (at >= 0) {
+                val local = localContext(at)
+                directFavoriteBanko = directFavoriteBanko || favoriteBankoWords.any { word -> wholePhrase(local, word) }
+                directStrong = directStrong || strongWords.any { word -> wholePhrase(local, word) } || Regex("★{3,5}").containsMatchIn(local)
+                directSurprise = directSurprise || surpriseWords.any { word -> wholePhrase(local, word) }
+                directPositive = directPositive || directStrong || directSurprise || positiveWords.any { word -> wholePhrase(local, word) }
+                directNegative = directNegative || negativeWords.any { phrase -> wholePhrase(local, phrase) }
+
+                if (listOf("jokeyiyle daha once yaris kazan", "ayni jokeyle daha once kazan", "bu jokeyle daha once kazan").any { local.contains(it) }) {
                     saha += 3; notes += "Aynı jokeyle daha önce kazanmış"
                 }
-                if (listOf("sadece o ata binecek jokey", "yalniz bu ata binecek jokey", "jokey sadece bu ata binecek").any { snippet.contains(it) }) {
+                if (listOf("sadece o ata binecek jokey", "yalniz bu ata binecek jokey", "jokey sadece bu ata binecek").any { local.contains(it) }) {
                     saha += 1; notes += "Jokey gün içinde yalnız bu ata biniyor"
                 }
-                if (listOf("taki degisikligi", "aksesuar degisikligi").any { snippet.contains(it) }) {
-                    notes += "Takı değişikliği var"
-                }
-                if (listOf("sehir degisikligi", "hipodrom degisikligi").any { snippet.contains(it) }) {
-                    notes += "Şehir/hipodrom değişikliği var"
-                }
-                start = text.indexOf(needle, start + needle.length)
+                if (listOf("taki degisikligi", "aksesuar degisikligi").any { local.contains(it) }) notes += "Takı değişikliği var"
+                if (listOf("sehir degisikligi", "hipodrom degisikligi").any { local.contains(it) }) notes += "Şehir/hipodrom değişikliği var"
+                at = text.indexOf(needle, at + needle.length)
             }
         }
 
-        val listFavoriteBanko = numberRecommendation(text, horse.no, validNos, favoriteBankoWords)
-        val listStrong = numberRecommendation(text, horse.no, validNos, strongWords)
-        val listPositive = numberRecommendation(text, horse.no, validNos, positiveWords)
-        val listSurprise = numberRecommendation(text, horse.no, validNos, surpriseWords)
-        val listNegative = numberRecommendation(text, horse.no, validNos, negativeWords)
+        // Numarayla yazilan kupon/tahmin listeleri icin daha katı eslesme. Favori/Banko icin
+        // sadece etiketle ayni kisa segmentte ve etikete en yakin numara(lar) kabul edilir.
+        val listFavoriteBanko = strictNumberRecommendation(text, horse.no, validNos, favoriteBankoWords, 42, 3)
+        val listStrong = strictNumberRecommendation(text, horse.no, validNos, strongWords, 55, 5)
+        val listPositive = strictNumberRecommendation(text, horse.no, validNos, positiveWords, 70, 6)
+        val listSurprise = strictNumberRecommendation(text, horse.no, validNos, surpriseWords, 50, 4)
+        val listNegative = strictNumberRecommendation(text, horse.no, validNos, negativeWords, 50, 4)
+
         val negative = directNegative || listNegative
-        val favoriteBanko = directFavoriteBanko || listFavoriteBanko
-        val strong = directStrong || listStrong || favoriteBanko
-        val surprise = directSurprise || listSurprise
-        val positive = directPositive || listPositive || strong || surprise
+        val favoriteBanko = (directFavoriteBanko || listFavoriteBanko) && !negative
+        val strong = (directStrong || listStrong || favoriteBanko) && !negative
+        val surprise = (directSurprise || listSurprise) && !negative
+        val positive = (directPositive || listPositive || strong || surprise) && !negative
         return ParsedHorseText(positive, strong, favoriteBanko, surprise, negative, saha.coerceIn(-4, 6), notes.distinct())
     }
 
-    private fun numberRecommendation(text: String, horseNo: Int, validNos: Set<Int>, labels: List<String>): Boolean {
+    private fun wholePhrase(text: String, phrase: String): Boolean =
+        Regex("(^|[^a-z0-9])" + Regex.escape(phrase) + "([^a-z0-9]|$)").containsMatchIn(text)
+
+    private fun strictNumberRecommendation(
+        text: String,
+        horseNo: Int,
+        validNos: Set<Int>,
+        labels: List<String>,
+        radius: Int,
+        maxNumbers: Int
+    ): Boolean {
         labels.forEach { label ->
             var i = text.indexOf(label)
             while (i >= 0) {
-                val from = max(0, i - 65)
-                val end = min(text.length, i + label.length + 85)
-                val snippet = text.substring(from, end)
-                val nums = Regex("\\b\\d{1,2}\\b").findAll(snippet).mapNotNull { it.value.toIntOrNull() }
-                    .filter { it in validNos }.toSet()
-                if (horseNo in nums) return true
+                val pipeL = text.lastIndexOf('|', i).takeIf { it >= 0 } ?: max(0, i - radius)
+                val pipeR = text.indexOf('|', i + label.length).takeIf { it >= 0 } ?: min(text.length, i + label.length + radius)
+                val from = max(pipeL, i - radius)
+                val to = min(pipeR, i + label.length + radius)
+                val segment = text.substring(max(0, from), min(text.length, to))
+                val numberMatches = Regex("\\b\\d{1,2}\\b").findAll(segment)
+                    .mapNotNull { m -> m.value.toIntOrNull()?.takeIf { it in validNos }?.let { n -> n to m.range.first } }
+                    .toList()
+                val distinct = numberMatches.map { it.first }.distinct()
+                if (distinct.size in 1..maxNumbers) {
+                    val labelCenter = segment.indexOf(label).coerceAtLeast(0) + label.length / 2
+                    val minDist = numberMatches.minOfOrNull { (_, pos) -> kotlin.math.abs(pos - labelCenter) }
+                    val targetDist = numberMatches.filter { it.first == horseNo }.minOfOrNull { (_, pos) -> kotlin.math.abs(pos - labelCenter) }
+                    // Hedef numara etikete en yakin grup icindeyse kabul et. Uzaktaki program/HP/AGF numaralarini alma.
+                    if (targetDist != null && minDist != null && targetDist <= minDist + 8) return true
+                }
                 i = text.indexOf(label, i + label.length)
             }
         }
@@ -945,7 +994,9 @@ object ExpertRepository {
 
     private fun normalizeExpert(v: String): String = v.lowercase(Locale.forLanguageTag("tr-TR"))
         .replace("ı", "i").replace("ş", "s").replace("ğ", "g").replace("ü", "u").replace("ö", "o").replace("ç", "c")
-        .replace(Regex("[^a-z0-9 ★./:-]+"), " ").replace(Regex("\\s+"), " ").trim()
+        .replace(Regex("[\\r\\n]+"), " | ")
+        .replace(Regex("[^a-z0-9 ★./:|+-]+"), " ")
+        .replace(Regex("\\s+"), " ").replace(Regex("(?: \\| ){2,}"), " | ").trim()
 
     private fun dateParts(date: String): Triple<Int, Int, Int> {
         val p = date.split("/")
@@ -1283,8 +1334,10 @@ object Predictor {
             // Uzman sırası yalnız uzman görüşlerinden oluşur. Predictor'daki uzman bileşeniyle
             // aynı mantık kullanılır: normal destek taban, güçlü ve favori/banko ek ağırlık,
             // sürpriz küçük pozitif sinyal, olumsuz görüş ise düşürücü sinyaldir.
-            return ratio * .54 + strongRatio * .25 + favoriteBankoRatio * .15 +
-                surpriseRatio * .06 - negativeRatio * .38
+            // Hiyerarsi: Favori/Banko > Güçlü > normal destek > sürpriz; olumsuz ciddi ceza.
+            // strong/support katmanli sinyallerdir; banko alan at ayni zamanda güçlü ve destekli sayilir.
+            return favoriteBankoRatio * 4.0 + strongRatio * 2.0 + ratio * 1.0 +
+                surpriseRatio * 0.25 - negativeRatio * 3.0
         }
         fun expertRank(h: Horse): Int? {
             if ((expert?.sourceCount ?: 0) <= 0) return null
@@ -1546,6 +1599,15 @@ fun TwoHorseApp() {
             }
         }
 
+        // History yalniz uzman refresh callback'ine bagli kalmasin. Uygulama acikken gelecekteki
+        // kosularin son pre-race snapshot'ini periyodik olarak garanti altina al.
+        LaunchedEffect(meetings, expertSignals) {
+            while (meetings.isNotEmpty()) {
+                withContext(Dispatchers.IO) { HistoryStore.capture(context, meetings, expertSignals) }
+                delay(15_000)
+            }
+        }
+
         BackHandler(enabled = selectedRace != null || selectedHistory != null || historyOpen || sixliOpen) {
             when { selectedRace != null -> selectedRace = null; selectedHistory != null -> selectedHistory = null; historyOpen -> historyOpen = false; sixliOpen -> sixliOpen = false }
         }
@@ -1554,7 +1616,7 @@ fun TwoHorseApp() {
             when {
                 selectedRace != null -> RaceDetail(selectedRace!!, expertSignals[raceKey(selectedRace!!)], expertsRefreshing, onBack = { selectedRace = null })
                 selectedHistory != null -> HistoryDetail(selectedHistory!!, onBack = { selectedHistory = null })
-                historyOpen -> HistoryScreen(HistoryStore.load(context), onBack = { historyOpen = false }, onOpen = { selectedHistory = it })
+                historyOpen -> HistoryScreen(context, onBack = { historyOpen = false }, onOpen = { selectedHistory = it })
                 sixliOpen -> SixliScreen(meetings, expertSignals, expertsRefreshing, onBack = { sixliOpen = false }, onRace = { selectedRace = it })
                 else -> Home(meetings, expertSignals, loading, refreshing, error, { refresh(forceExperts = true) }, { selectedRace = it }, { historyOpen = true }, { sixliOpen = true })
             }
@@ -1841,32 +1903,91 @@ private fun SixliScreen(meetings: List<Meeting>, experts: Map<String, RaceExpert
 }
 
 @Composable
-private fun HistoryScreen(snapshots: List<HistorySnapshot>, onBack: () -> Unit, onOpen: (HistorySnapshot) -> Unit) {
+private fun HistoryScreen(context: Context, onBack: () -> Unit, onOpen: (HistorySnapshot) -> Unit) {
     var nowTick by remember { mutableLongStateOf(System.currentTimeMillis()) }
-    LaunchedEffect(Unit) { while(true){ delay(1000); nowTick=System.currentTimeMillis() } }
-    val ended = remember(snapshots, nowTick) { snapshots.filter { secondsUntil(it.race.time, nowTick) <= 0L }.sortedByDescending { it.race.time } }
-    Column(Modifier.fillMaxSize().statusBarsPadding()) {
-        Row(Modifier.fillMaxWidth().padding(8.dp), verticalAlignment=Alignment.CenterVertically) {
-            IconButton(onClick=onBack){ Icon(Icons.Default.ArrowBack,"Geri") }
-            Column { Text("Geçmiş",fontWeight=FontWeight.Black,fontSize=24.sp); Text("Yalnız bugün biten koşular · kayıtlı tahmin",color=Muted,fontSize=11.sp) }
+    var snapshots by remember { mutableStateOf(HistoryStore.load(context)) }
+    LaunchedEffect(Unit) {
+        while (true) {
+            delay(1000)
+            nowTick = System.currentTimeMillis()
+            snapshots = withContext(Dispatchers.IO) { HistoryStore.load(context) }
         }
-        if(ended.isEmpty()) Box(Modifier.fillMaxSize(),contentAlignment=Alignment.Center){ Text("Henüz bu kurulumda yarış öncesi kaydedilip biten koşu yok.",color=Muted) }
-        else LazyColumn(Modifier.fillMaxSize(),contentPadding=PaddingValues(18.dp),verticalArrangement=Arrangement.spacedBy(10.dp)) {
-            items(ended){ snap -> Card(Modifier.fillMaxWidth().clickable{onOpen(snap)},colors=CardDefaults.cardColors(containerColor=Surface),shape=RoundedCornerShape(16.dp)){
-                Row(Modifier.fillMaxWidth().padding(15.dp),verticalAlignment=Alignment.CenterVertically){ Column(Modifier.weight(1f)){Text("${snap.race.city} · ${snap.race.number}. Koşu",fontWeight=FontWeight.Black);Text("${snap.race.time} · Bitti · ${snap.picks.size} at",color=Muted,fontSize=11.sp)}; Text("Kayıtlı analiz ›",color=Green,fontWeight=FontWeight.Bold,fontSize=11.sp) }
-            }}
+    }
+    val ended = remember(snapshots, nowTick) {
+        snapshots.filter { secondsUntil(it.race.time, nowTick) <= 0L }
+            .sortedWith(compareByDescending<HistorySnapshot> { it.race.time }.thenBy { it.race.city })
+    }
+    Column(Modifier.fillMaxSize().statusBarsPadding()) {
+        Row(Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 6.dp), verticalAlignment = Alignment.CenterVertically) {
+            IconButton(onClick = onBack) { Icon(Icons.Default.ArrowBack, "Geri") }
+            Column {
+                Text("Geçmiş", fontWeight = FontWeight.Black, fontSize = 24.sp)
+                Text("Bugün biten koşular · yarış öncesi kayıt", color = Muted, fontSize = 11.sp)
+            }
+        }
+        if (ended.isEmpty()) {
+            Box(Modifier.fillMaxSize().padding(28.dp), contentAlignment = Alignment.Center) {
+                Card(colors = CardDefaults.cardColors(containerColor = Surface), shape = RoundedCornerShape(20.dp), border = CardDefaults.outlinedCardBorder()) {
+                    Column(Modifier.padding(22.dp), horizontalAlignment = Alignment.CenterHorizontally) {
+                        Icon(Icons.Default.History, contentDescription = null, tint = Muted, modifier = Modifier.size(34.dp))
+                        Spacer(Modifier.height(10.dp))
+                        Text("Henüz kayıtlı bitmiş koşu yok", fontWeight = FontWeight.Black, fontSize = 16.sp)
+                        Spacer(Modifier.height(5.dp))
+                        Text("Uygulama açıkken yaklaşan koşular otomatik kaydedilir; yarış bitince burada görünür.", color = Muted, fontSize = 11.sp, lineHeight = 16.sp)
+                    }
+                }
+            }
+        } else LazyColumn(
+            Modifier.fillMaxSize(), contentPadding = PaddingValues(18.dp), verticalArrangement = Arrangement.spacedBy(10.dp)
+        ) {
+            items(ended, key = { raceKey(it.race) }) { snap ->
+                val top = snap.picks.firstOrNull()
+                Card(
+                    Modifier.fillMaxWidth().clickable { onOpen(snap) },
+                    colors = CardDefaults.cardColors(containerColor = Surface), shape = RoundedCornerShape(18.dp), border = CardDefaults.outlinedCardBorder()
+                ) {
+                    Row(Modifier.fillMaxWidth().padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
+                        Box(Modifier.size(46.dp).background(Ink, RoundedCornerShape(13.dp)), contentAlignment = Alignment.Center) {
+                            Text(snap.race.number.toString(), color = Color.White, fontWeight = FontWeight.Black, fontSize = 17.sp)
+                        }
+                        Spacer(Modifier.width(12.dp))
+                        Column(Modifier.weight(1f)) {
+                            Text("${snap.race.city} · ${snap.race.number}. Koşu", fontWeight = FontWeight.Black, fontSize = 15.sp)
+                            Text("${snap.race.time} · Bitti", color = Muted, fontSize = 10.sp)
+                            top?.let { Text("Kayıtlı favori: #${it.horse.no} ${it.horse.name} · ${it.score}/100", color = Green, fontSize = 10.sp, fontWeight = FontWeight.Bold) }
+                        }
+                        Icon(Icons.Default.KeyboardArrowRight, contentDescription = "Aç", tint = Muted)
+                    }
+                }
+            }
         }
     }
 }
 
 @Composable
 private fun HistoryDetail(snapshot: HistorySnapshot, onBack: () -> Unit) {
-    val race=snapshot.race
-    Column(Modifier.fillMaxSize().statusBarsPadding()) {
-        Row(Modifier.fillMaxWidth().padding(8.dp),verticalAlignment=Alignment.CenterVertically){IconButton(onClick=onBack){Icon(Icons.Default.ArrowBack,"Geri")};Column{Text("${race.city} · ${race.number}. Koşu",fontWeight=FontWeight.Black,fontSize=20.sp);Text("Yarış öncesi kaydedilmiş analiz",color=Muted,fontSize=10.sp)}}
-        LazyColumn(Modifier.fillMaxSize(),contentPadding=PaddingValues(18.dp),verticalArrangement=Arrangement.spacedBy(10.dp)){
-            item { Text("Kayıtlı sıralama",fontWeight=FontWeight.Black,fontSize=18.sp) }
-            items(snapshot.picks){ HorseCard(it) }
+    val race = snapshot.race
+    val picks = snapshot.picks
+    val surprise = picks.firstOrNull { it.label == "Sürpriz" } ?: picks.getOrNull(2)
+    BackHandler(onBack = onBack)
+    LazyColumn(
+        Modifier.fillMaxSize().navigationBarsPadding(),
+        contentPadding = PaddingValues(start = 18.dp, end = 18.dp, bottom = 36.dp),
+        verticalArrangement = Arrangement.spacedBy(12.dp)
+    ) {
+        item {
+            Row(Modifier.fillMaxWidth().statusBarsPadding().padding(top = 4.dp), verticalAlignment = Alignment.CenterVertically) {
+                IconButton(onClick = onBack) { Icon(Icons.Default.ArrowBack, "Geri") }
+                Column(Modifier.weight(1f)) {
+                    Text("${race.city} · ${race.number}. Koşu", fontWeight = FontWeight.Black, fontSize = 21.sp)
+                    Text("Yarış öncesi kaydedilmiş analiz · ${race.time}", color = Muted, fontSize = 10.sp)
+                }
+            }
+        }
+        if (picks.isNotEmpty()) {
+            item { ResultHero(picks.first(), picks.getOrNull(1), surprise) }
+            item { SectionTitle("Kayıtlı sıralama · tüm atlar") }
+            items(picks, key = { it.horse.no }) { HorseCard(it) }
         }
     }
 }
@@ -2190,7 +2311,7 @@ fun RaceDetail(race: Race, expert: RaceExpertSignal?, expertsRefreshing: Boolean
 
 @Composable
 private fun ExpertStatusCard(expert: RaceExpertSignal?, loading: Boolean) {
-    val configured = expert?.configuredSourceCount ?: 7
+    val configured = expert?.configuredSourceCount ?: 8
     val reachable = expert?.reachableSourceCount ?: 0
     val usable = expert?.sourceCount ?: 0
     val fresh = expert?.freshSourceCount ?: 0
