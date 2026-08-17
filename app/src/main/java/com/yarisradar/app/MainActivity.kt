@@ -181,11 +181,11 @@ object VideoRepository {
             }.getOrNull()
 
             fun anchorLabel(a: org.jsoup.nodes.Element): String {
-                val own = a.text().replace(Regex("\s+"), " ").trim()
-                if (own.contains("Koşu", true) && Regex("\b\d{2}[./]\d{2}[./]\d{4}\b").containsMatchIn(own)) return own
-                val row = a.closest("tr")?.text()?.replace(Regex("\s+"), " ")?.trim().orEmpty()
-                if (row.contains("Koşu", true) && Regex("\b\d{2}[./]\d{2}[./]\d{4}\b").containsMatchIn(row)) return row
-                val parent = a.parent()?.text()?.replace(Regex("\s+"), " ")?.trim().orEmpty()
+                val own = a.text().replace(Regex("\\s+"), " ").trim()
+                if (own.contains("Koşu", true) && Regex("\\b\\d{2}[./]\\d{2}[./]\\d{4}\\b").containsMatchIn(own)) return own
+                val row = a.closest("tr")?.text()?.replace(Regex("\\s+"), " ")?.trim().orEmpty()
+                if (row.contains("Koşu", true) && Regex("\\b\\d{2}[./]\\d{2}[./]\\d{4}\\b").containsMatchIn(row)) return row
+                val parent = a.parent()?.text()?.replace(Regex("\\s+"), " ")?.trim().orEmpty()
                 return parent
             }
 
@@ -194,7 +194,7 @@ object VideoRepository {
                 if (!href.contains("YarisVideoAt", true) || !href.contains("KosuKodu", true)) return@mapNotNull null
                 val label = anchorLabel(a)
                 val looksLikeRace = label.contains("Koşu", ignoreCase = true) &&
-                    Regex("\b\d{2}[./]\d{2}[./]\d{4}\b").containsMatchIn(label)
+                    Regex("\\b\\d{2}[./]\\d{2}[./]\\d{4}\\b").containsMatchIn(label)
                 if (!looksLikeRace) return@mapNotNull null
                 RaceVideo(label, href)
             }.distinctBy { it.url }
@@ -635,7 +635,7 @@ object ExpertRepository {
 
         // Bazı tahmin siteleri koşu numarası yerine 1.AYAK/2.AYAK kullanıyor.
         // 2. altılının başlangıç koşusunu sayfadan bulup ayak -> koşu eşlemesi yap.
-        val secondStart = Regex("2\.?\s*altili(?:\s*ganyan)?(?:\s*tahmin)?[^0-9]{0,80}(\d{1,2})\.?\s*kosu")
+        val secondStart = Regex("2\\.?\\s*altili(?:\\s*ganyan)?(?:\\s*tahmin)?[^0-9]{0,80}(\\d{1,2})\\.?\\s*kosu")
             .find(text)?.groupValues?.getOrNull(1)?.toIntOrNull()
         val firstStart = if (secondStart != null) max(1, secondStart - 6) else max(1, totalRaces - 11)
         val useSecond = secondStart != null && raceNo >= secondStart
@@ -667,7 +667,7 @@ object ExpertRepository {
         val horseNames = race.horses.count { h -> normalize(h.name).length >= 4 && section.contains(normalize(h.name)) }
         if (horseNames >= 1) return true
         val validNos = race.horses.map { it.no }.toSet()
-        val nums = Regex("\b\d{1,2}\b").findAll(section).mapNotNull { it.value.toIntOrNull() }
+        val nums = Regex("\\b\\d{1,2}\\b").findAll(section).mapNotNull { it.value.toIntOrNull() }
             .filter { it in validNos }.toSet()
         val hasTipLanguage = listOf("ayak", "favori", "banko", "tek", "rakip", "surpriz", "plase", "tahmin").any { section.contains(it) }
         return hasTipLanguage && nums.isNotEmpty()
