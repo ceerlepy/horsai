@@ -31,6 +31,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
@@ -509,14 +510,29 @@ object ExpertRepository {
         return buildSignals(meetings, cityDocs)
     }
 
-    suspend fun load(context: Context, meetings: List<Meeting>): Map<String, RaceExpertSignal> = withContext(Dispatchers.IO) {
+    suspend fun loadIncremental(
+        context: Context,
+        meetings: List<Meeting>,
+        onUpdate: suspend (Map<String, RaceExpertSignal>) -> Unit
+    ): Map<String, RaceExpertSignal> = withContext(Dispatchers.IO) {
         if (meetings.isEmpty()) return@withContext emptyMap()
+
+        // Cache önce: canlı kaynaklar gelene kadar ekranda 0/7 göstermeyelim.
+        val docsByCity = meetings.distinctBy { it.city }.associate { meeting ->
+            meeting.city to sources.mapNotNull { source ->
+                loadCached(context, source.name, meeting.city, meeting.date)?.let { SourceDoc(source, it, false) }
+            }.toMutableList()
+        }.toMutableMap()
+
+        val initial = buildSignals(meetings, docsByCity.mapValues { it.value.toList() })
+        if (initial.isNotEmpty()) withContext(Dispatchers.Main) { onUpdate(initial) }
+
         supervisorScope {
-            val uniqueMeetings = meetings.distinctBy { it.city }
-            val jobs = uniqueMeetings.flatMap { meeting ->
+            val jobs = meetings.distinctBy { it.city }.flatMap { meeting ->
                 sources.map { source ->
                     async {
-                        val fresh = withTimeoutOrNull(16000) { fetchSource(source, meeting.city, meeting.date) }
+                        // Kaynağın tüm URL/discovery zincirinin toplam süresi sınırlandırılır.
+                        val fresh = withTimeoutOrNull(15000) { fetchSource(source, meeting.city, meeting.date) }
                         val cached = if (fresh == null) loadCached(context, source.name, meeting.city, meeting.date) else null
                         if (fresh != null) saveCached(context, source.name, meeting.city, meeting.date, fresh)
                         Triple(meeting.city, source, fresh?.let { SourceDoc(source, it, true) }
@@ -524,11 +540,26 @@ object ExpertRepository {
                     }
                 }
             }
-            val cityDocs = jobs.awaitAll()
-                .filter { it.third != null }
-                .groupBy({ it.first }, { it.third!! })
-            buildSignals(meetings, cityDocs)
+
+            // Her kaynak tamamlandığı anda state/model güncellenir; tüm 7 kaynağı beklemiyoruz.
+            jobs.forEach { job ->
+                launch {
+                    val (city, source, doc) = job.await()
+                    if (doc != null) {
+                        val snapshot = synchronized(docsByCity) {
+                            val list = docsByCity.getOrPut(city) { mutableListOf() }
+                            list.removeAll { it.source.name == source.name }
+                            list.add(doc)
+                            docsByCity.mapValues { (_, v) -> v.toList() }
+                        }
+                        val signals = buildSignals(meetings, snapshot)
+                        withContext(Dispatchers.Main) { onUpdate(signals) }
+                    }
+                }
+            }
         }
+
+        buildSignals(meetings, synchronized(docsByCity) { docsByCity.mapValues { it.value.toList() } })
     }
 
     private fun buildSignals(meetings: List<Meeting>, cityDocs: Map<String, List<SourceDoc>>): Map<String, RaceExpertSignal> = buildMap {
@@ -1372,7 +1403,15 @@ fun TwoHorseApp() {
         LaunchedEffect(Unit) { refresh() }
         LaunchedEffect(meetings) {
             if (meetings.isNotEmpty()) {
-                val loadedExperts = ExpertRepository.load(context, meetings)
+                // Yeni TJK programı geldiyse bile önce aynı günün uzman cache'ini anında göster.
+                val cachedExperts = ExpertRepository.loadCachedOnly(context, meetings)
+                if (cachedExperts.isNotEmpty()) expertSignals = cachedExperts
+
+                val loadedExperts = ExpertRepository.loadIncremental(context, meetings) { partial ->
+                    // Her uzman kaynağı geldikçe Predictor/RaceDetail otomatik recomposition ile yeniden hesaplanır.
+                    expertSignals = partial
+                    HistoryStore.capture(context, meetings, partial)
+                }
                 expertSignals = loadedExperts
                 HistoryStore.capture(context, meetings, loadedExperts)
             }
@@ -1586,11 +1625,17 @@ private fun TopHeader(onRefresh: () -> Unit, refreshing: Boolean, onHistory: () 
                 .padding(start = 18.dp, end = 8.dp, top = 8.dp, bottom = 10.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
-            Image(
-                painter = painterResource(id = R.drawable.two_horse_logo),
-                contentDescription = "Two Horse",
-                modifier = Modifier.offset(x = 4.dp).size(if (compact) 46.dp else 52.dp).clip(RoundedCornerShape(16.dp))
-            )
+            Box(
+                modifier = Modifier.size(if (compact) 48.dp else 54.dp),
+                contentAlignment = Alignment.Center
+            ) {
+                Image(
+                    painter = painterResource(id = R.drawable.two_horse_logo),
+                    contentDescription = "Two Horse",
+                    contentScale = ContentScale.Crop,
+                    modifier = Modifier.fillMaxSize().clip(RoundedCornerShape(16.dp))
+                )
+            }
             Spacer(Modifier.width(12.dp))
             Column(Modifier.weight(1f)) {
                 Text("Two Horse", fontWeight = FontWeight.Black, fontSize = if (compact) 23.sp else 27.sp, color = Ink, maxLines = 1)
@@ -1943,9 +1988,27 @@ private fun ResultHero(favorite: Pick, rival: Pick?, surprise: Pick?) {
 
 @Composable
 private fun MetricLine(label: String, value: String) {
-    Row(Modifier.fillMaxWidth().padding(vertical = 2.dp), verticalAlignment = Alignment.CenterVertically) {
-        Text(label, color = Color.White.copy(.58f), fontSize = 11.sp, modifier = Modifier.weight(1f))
-        Text(value, color = Color.White, fontSize = 11.sp, fontWeight = FontWeight.SemiBold)
+    BoxWithConstraints(Modifier.fillMaxWidth().padding(vertical = 3.dp)) {
+        val stacked = maxWidth < 330.dp || value.length > 30 || label.length > 12
+        if (stacked) {
+            Column(Modifier.fillMaxWidth()) {
+                Text(label, color = Color.White.copy(.58f), fontSize = 10.sp, maxLines = 1)
+                Spacer(Modifier.height(2.dp))
+                Text(
+                    value,
+                    color = Color.White,
+                    fontSize = 11.sp,
+                    fontWeight = FontWeight.SemiBold,
+                    modifier = Modifier.fillMaxWidth()
+                )
+            }
+        } else {
+            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                Text(label, color = Color.White.copy(.58f), fontSize = 11.sp, modifier = Modifier.weight(1f), maxLines = 1)
+                Spacer(Modifier.width(10.dp))
+                Text(value, color = Color.White, fontSize = 11.sp, fontWeight = FontWeight.SemiBold)
+            }
+        }
     }
 }
 
