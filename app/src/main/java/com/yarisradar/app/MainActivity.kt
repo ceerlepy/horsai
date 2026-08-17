@@ -19,6 +19,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.ArrowBack
 import androidx.compose.material.icons.filled.Bolt
 import androidx.compose.material.icons.filled.CloudOff
+import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.KeyboardArrowDown
 import androidx.compose.material.icons.filled.KeyboardArrowUp
 import androidx.compose.material.icons.filled.MoreVert
@@ -39,6 +40,8 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
@@ -74,6 +77,7 @@ private val PaleGold = Color(0xFFFFF3D9)
 private val Red = Color(0xFFB64A3A)
 private val PaleRed = Color(0xFFFFECE8)
 private val Border = Color(0xFFE1E7E3)
+private val LoadingBlue = Color(0xFF1976D2)
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -111,7 +115,8 @@ data class Meeting(
     val city: String,
     val date: String,
     val trackInfo: String,
-    val races: List<Race>
+    val races: List<Race>,
+    val sixliStarts: List<Int> = emptyList()
 )
 
 data class ExpertHorseSignal(
@@ -258,9 +263,9 @@ object HistoryStore {
         val now = System.currentTimeMillis()
         meetings.flatMap { it.races }.forEach { race ->
             val key = raceKey(race)
-            // Yalnız yarış başlamadan önce snapshot al. Uygulama yarıştan sonra ilk kez açılırsa
-            // o koşu için sonradan "tahmin üretmiş" gibi history oluşturma.
-            if (!root.has(key) && secondsUntil(race.time, now) > 0L) {
+            // Yarış başlayana kadar snapshot'ı güncel tut (uzman kaynakları geldikçe puan/sıra değişebilir).
+            // Yarış saati geçince artık dokunma: geçmişte görülen analiz yarış öncesi son halidir.
+            if (secondsUntil(race.time, now) > 0L) {
                 val picks = Predictor.picks(race, experts[key])
                 if (picks.isNotEmpty()) root.put(key, snapshotToJson(HistorySnapshot(race, picks)))
             }
@@ -349,7 +354,7 @@ object MeetingCache {
                             ))
                         }
                     }
-                    add(Meeting(m.getString("city"), m.getString("date"), m.optString("trackInfo"), races))
+                    add(Meeting(m.getString("city"), m.getString("date"), m.optString("trackInfo"), races, (m.optJSONArray("sixliStarts") ?: JSONArray()).let { a -> (0 until a.length()).map { a.optInt(it) }.filter { it > 0 } }))
                 }
             }
         }.getOrDefault(emptyList())
@@ -378,7 +383,7 @@ object MeetingCache {
                     })
                 }
                 arr.put(JSONObject().apply {
-                    put("city", m.city); put("date", m.date); put("trackInfo", m.trackInfo); put("races", races)
+                    put("city", m.city); put("date", m.date); put("trackInfo", m.trackInfo); put("sixliStarts", JSONArray(m.sixliStarts)); put("races", races)
                 })
             }
             context.getSharedPreferences(PREF, Context.MODE_PRIVATE).edit()
@@ -1141,7 +1146,24 @@ object TjkRepository {
             Race(number, time, title, distance, surface, horses, city)
         }
 
-        return Meeting(city, date, trackInfo, races)
+        val sixliStarts = doc.select("h3").mapNotNull { h ->
+            val hm = Regex("^(\\d+)\\.\\s*Koşu", RegexOption.IGNORE_CASE).find(h.text().replace(Regex("\\s+"), " ").trim())
+                ?: return@mapNotNull null
+            val raceNo = hm.groupValues[1].toIntOrNull() ?: return@mapNotNull null
+            val context = buildString {
+                var e: Element? = h.previousElementSibling()
+                var seen = 0
+                while (e != null && seen < 16) {
+                    val t = e.text().replace(Regex("\\s+"), " ").trim()
+                    if (Regex("^\\d+\\.\\s*Koşu", RegexOption.IGNORE_CASE).containsMatchIn(t)) break
+                    append(' ').append(t)
+                    e = e.previousElementSibling(); seen++
+                }
+            }
+            raceNo.takeIf { context.contains("6'LI GANYAN", true) && context.contains("Bu koşudan başlar", true) }
+        }.distinct().sorted()
+
+        return Meeting(city, date, trackInfo, races, sixliStarts)
     }
 
     private fun parseHorses(table: Element): List<Horse> {
@@ -1409,13 +1431,18 @@ fun TwoHorseApp() {
         var expertSignals by remember { mutableStateOf<Map<String, RaceExpertSignal>>(emptyMap()) }
         var loading by remember { mutableStateOf(initialCache.isEmpty()) }
         var refreshing by remember { mutableStateOf(false) }
+        var expertsRefreshing by remember { mutableStateOf(false) }
         var error by remember { mutableStateOf<String?>(null) }
         var selectedRace by remember { mutableStateOf<Race?>(null) }
         var historyOpen by remember { mutableStateOf(false) }
+        var sixliOpen by remember { mutableStateOf(false) }
         var selectedHistory by remember { mutableStateOf<HistorySnapshot?>(null) }
+        var expertRefreshToken by remember { mutableIntStateOf(0) }
         val scope = rememberCoroutineScope()
+        val activity = LocalContext.current as? ComponentActivity
 
-        fun refresh() {
+        fun refresh(forceExperts: Boolean = false) {
+            if (refreshing) return
             scope.launch {
                 refreshing = true
                 if (meetings.isEmpty()) loading = true
@@ -1430,39 +1457,71 @@ fun TwoHorseApp() {
                 }
                 loading = false
                 refreshing = false
+                if (forceExperts) expertRefreshToken++
             }
         }
 
-        LaunchedEffect(Unit) { refresh() }
-        LaunchedEffect(meetings) {
+        // İlk açılışta cache hemen çizilir; TJK arka planda yenilenir.
+        LaunchedEffect(Unit) { refresh(forceExperts = false) }
+
+        // Uygulama gerçekten arka plana gittikten sonra tekrar ön plana gelirse otomatik yenile.
+        // İç ekran navigasyonları bunu tetiklemez. O sırada refresh sürüyorsa ikinci istek başlatılmaz.
+        DisposableEffect(activity) {
+            val lifecycle = activity?.lifecycle
+            var wasStopped = false
+            val observer = LifecycleEventObserver { _, event ->
+                when (event) {
+                    Lifecycle.Event.ON_STOP -> wasStopped = true
+                    Lifecycle.Event.ON_START -> if (wasStopped) {
+                        wasStopped = false
+                        refresh(forceExperts = true)
+                    }
+                    else -> Unit
+                }
+            }
+            lifecycle?.addObserver(observer)
+            onDispose { lifecycle?.removeObserver(observer) }
+        }
+
+        LaunchedEffect(meetings, expertRefreshToken) {
             if (meetings.isNotEmpty()) {
-                // Yeni TJK programı geldiyse bile önce aynı günün uzman cache'ini anında göster.
-                val cachedExperts = withContext(Dispatchers.Default) {
-                    ExpertRepository.loadCachedOnly(context, meetings)
-                }
-                if (cachedExperts.isNotEmpty()) expertSignals = cachedExperts
+                expertsRefreshing = true
+                try {
+                    // Yeni TJK programı geldiyse bile önce aynı günün uzman cache'ini göster.
+                    val cachedExperts = withContext(Dispatchers.Default) {
+                        ExpertRepository.loadCachedOnly(context, meetings)
+                    }
+                    if (cachedExperts.isNotEmpty()) expertSignals = cachedExperts
+                    // Gelecek yarışların snapshot'ını hemen oluştur; canlı uzmanlar geldikçe yarış saatine kadar overwrite edilir.
+                    withContext(Dispatchers.IO) { HistoryStore.capture(context, meetings, cachedExperts) }
 
-                val loadedExperts = ExpertRepository.loadIncremental(context, meetings) { partial ->
-                    // Batch halinde gelen uzman sonucu UI state'ine tek atomik güncelleme olarak verilir.
-                    expertSignals = partial
-                    // JSON snapshot yazımı scroll/Main thread'i bloke etmesin.
-                    launch(Dispatchers.IO) { HistoryStore.capture(context, meetings, partial) }
+                    val loadedExperts = ExpertRepository.loadIncremental(context, meetings) { partial ->
+                        // Batch halinde gelen uzman sonucu UI state'ine tek atomik güncelleme olarak verilir.
+                        expertSignals = partial
+                        // JSON snapshot yazımı scroll/Main thread'i bloke etmesin.
+                        launch(Dispatchers.IO) { HistoryStore.capture(context, meetings, partial) }
+                    }
+                    expertSignals = loadedExperts
+                    withContext(Dispatchers.IO) { HistoryStore.capture(context, meetings, loadedExperts) }
+                } finally {
+                    expertsRefreshing = false
                 }
-                expertSignals = loadedExperts
-                withContext(Dispatchers.IO) { HistoryStore.capture(context, meetings, loadedExperts) }
+            } else {
+                expertsRefreshing = false
             }
         }
 
-        BackHandler(enabled = selectedRace != null || selectedHistory != null || historyOpen) {
-            when { selectedRace != null -> selectedRace = null; selectedHistory != null -> selectedHistory = null; historyOpen -> historyOpen = false }
+        BackHandler(enabled = selectedRace != null || selectedHistory != null || historyOpen || sixliOpen) {
+            when { selectedRace != null -> selectedRace = null; selectedHistory != null -> selectedHistory = null; historyOpen -> historyOpen = false; sixliOpen -> sixliOpen = false }
         }
 
         Surface(Modifier.fillMaxSize(), color = Bg) {
             when {
-                selectedRace != null -> RaceDetail(selectedRace!!, expertSignals[raceKey(selectedRace!!)], onBack = { selectedRace = null })
+                selectedRace != null -> RaceDetail(selectedRace!!, expertSignals[raceKey(selectedRace!!)], expertsRefreshing, onBack = { selectedRace = null })
                 selectedHistory != null -> HistoryDetail(selectedHistory!!, onBack = { selectedHistory = null })
                 historyOpen -> HistoryScreen(HistoryStore.load(context), onBack = { historyOpen = false }, onOpen = { selectedHistory = it })
-                else -> Home(meetings, expertSignals, loading, refreshing, error, ::refresh, { selectedRace = it }, { historyOpen = true })
+                sixliOpen -> SixliScreen(meetings, expertSignals, onBack = { sixliOpen = false }, onRace = { selectedRace = it })
+                else -> Home(meetings, expertSignals, loading, refreshing, error, { refresh(forceExperts = true) }, { selectedRace = it }, { historyOpen = true }, { sixliOpen = true })
             }
         }
     }
@@ -1477,7 +1536,8 @@ fun Home(
     error: String?,
     onRefresh: () -> Unit,
     onRace: (Race) -> Unit,
-    onHistory: () -> Unit
+    onHistory: () -> Unit,
+    onSixli: () -> Unit
 ) {
     var selectedCity by remember(meetings) { mutableStateOf("Tümü") }
     var otherExpanded by remember { mutableStateOf(false) }
@@ -1522,7 +1582,7 @@ fun Home(
     val lowerRaceCount = lowerMeetings.sumOf { it.races.size }
 
     Column(Modifier.fillMaxSize()) {
-        TopHeader(onRefresh, refreshing, onHistory)
+        TopHeader(onRefresh, refreshing, onHistory, onSixli)
         when {
             loading -> LoadingState()
             meetings.isEmpty() -> EmptyState(error, onRefresh)
@@ -1568,6 +1628,168 @@ fun Home(
     }
 }
 
+
+data class SixliCoupon(val name: String, val subtitle: String, val legs: List<List<Pick>>) {
+    val combinations: Long get() = legs.fold(1L) { acc, leg -> acc * leg.size.coerceAtLeast(1) }
+}
+
+data class SixliWindow(val meeting: Meeting, val startRace: Int, val races: List<Race>)
+
+private fun availableSixliWindows(meetings: List<Meeting>, now: Long = System.currentTimeMillis()): List<SixliWindow> {
+    return meetings.flatMap { m ->
+        val starts = if (m.sixliStarts.isNotEmpty()) m.sixliStarts else {
+            // Eski cache'te marker yoksa yalnız güvenli fallback: programda tam 6 koşuluk bloklar.
+            when (m.races.size) {
+                6 -> listOf(m.races.firstOrNull()?.number ?: 1)
+                8 -> listOf(1, 3)
+                else -> emptyList()
+            }
+        }
+        starts.mapNotNull { start ->
+            val rs = (start until start + 6).mapNotNull { n -> m.races.firstOrNull { it.number == n } }
+            if (rs.size == 6 && secondsUntil(rs.first().time, now) > 0L) SixliWindow(m, start, rs) else null
+        }
+    }.sortedBy { secondsUntil(it.races.first().time, now) }
+}
+
+private fun buildSixliCoupons(window: SixliWindow, experts: Map<String, RaceExpertSignal>): List<SixliCoupon> {
+    val ranked = window.races.map { r -> Predictor.picks(r, experts[raceKey(r)]) }
+    fun gap(ps: List<Pick>): Int = if (ps.size >= 2) ps[0].score - ps[1].score else 99
+    fun certainty(ps: List<Pick>): Double {
+        if (ps.isEmpty()) return -999.0
+        val p = ps.first()
+        val bankoBonus = p.expertFavoriteBanko * 2.5
+        val supportRatio = if (p.expertTotal > 0) p.expertSupport.toDouble() / p.expertTotal else 0.0
+        return p.score + gap(ps) * 1.8 + bankoBonus + supportRatio * 8.0
+    }
+    val bankerIndex = ranked.indices.maxByOrNull { certainty(ranked[it]) } ?: 0
+    val secondStrong = ranked.indices.filter { it != bankerIndex }.maxByOrNull { certainty(ranked[it]) }
+
+    fun countFor(ps: List<Pick>, mode: Int, idx: Int): Int {
+        if (ps.isEmpty()) return 0
+        val g = gap(ps)
+        val top = ps.first().score
+        val field = ps.size
+        return when (mode) {
+            0 -> when {
+                idx == bankerIndex -> 1
+                idx == secondStrong && top >= 74 && g >= 7 -> min(2, field)
+                top >= 76 && g >= 8 -> min(2, field)
+                top >= 68 && g >= 4 -> min(3, field)
+                else -> min(4, field)
+            }
+            1 -> when {
+                top >= 80 && g >= 10 -> min(2, field)
+                top >= 72 && g >= 5 -> min(3, field)
+                else -> min(4, field)
+            }
+            else -> when {
+                top >= 84 && g >= 12 -> min(2, field)
+                top >= 76 && g >= 7 -> min(3, field)
+                top >= 66 -> min(4, field)
+                else -> min(6, field)
+            }
+        }
+    }
+    fun make(mode: Int, name: String, subtitle: String) = SixliCoupon(name, subtitle, ranked.mapIndexed { i, ps -> ps.take(countFor(ps, mode, i)) })
+    return listOf(
+        make(0, "Dar Kupon", "Bir ayakta TEK · diğer ayaklar güvene göre 2–4 at"),
+        make(1, "Dengeli Kupon", "Maliyet ve güven dengesi · ayaklar 2–4 at"),
+        make(2, "En Risksiz", "En geniş koruma · açık ayaklarda 4–6 ata kadar")
+    )
+}
+
+@Composable
+private fun SixliScreen(meetings: List<Meeting>, experts: Map<String, RaceExpertSignal>, onBack: () -> Unit, onRace: (Race) -> Unit) {
+    var selectedWindowKey by remember { mutableStateOf<String?>(null) }
+    val windows = remember(meetings) { availableSixliWindows(meetings) }
+    val selected = windows.firstOrNull { "${it.meeting.city}-${it.startRace}" == selectedWindowKey } ?: windows.firstOrNull()
+    Column(Modifier.fillMaxSize().statusBarsPadding()) {
+        Row(Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 6.dp), verticalAlignment = Alignment.CenterVertically) {
+            IconButton(onClick = onBack) { Icon(Icons.Default.ArrowBack, "Geri") }
+            Column(Modifier.weight(1f)) {
+                Text("6’lı Kupon", fontWeight = FontWeight.Black, fontSize = 24.sp, color = Ink)
+                Text("Model + AGF + uzman + form verisinden 3 strateji", color = Muted, fontSize = 11.sp)
+            }
+        }
+        if (windows.isEmpty()) {
+            Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                Text("Şu an başlamamış 6’lı Ganyan bulunamadı.", color = Muted)
+            }
+            return@Column
+        }
+        LazyColumn(
+            modifier = Modifier.fillMaxSize().navigationBarsPadding(),
+            contentPadding = PaddingValues(horizontal = 16.dp, vertical = 8.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp)
+        ) {
+            item {
+                Text("Aktif 6’lılar", fontWeight = FontWeight.Black, fontSize = 13.sp, color = Ink)
+                Spacer(Modifier.height(8.dp))
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    windows.forEach { w ->
+                        val key = "${w.meeting.city}-${w.startRace}"
+                        FilterChip(
+                            selected = selected?.meeting?.city == w.meeting.city && selected?.startRace == w.startRace,
+                            onClick = { selectedWindowKey = key },
+                            label = { Text("${w.meeting.city} · ${w.startRace}. koşu") }
+                        )
+                    }
+                }
+            }
+            selected?.let { w ->
+                item {
+                    Card(colors = CardDefaults.cardColors(containerColor = PaleGreen), shape = RoundedCornerShape(18.dp)) {
+                        Column(Modifier.fillMaxWidth().padding(16.dp)) {
+                            Text("${w.meeting.city} · ${w.startRace}. koşudan başlar", color = Green, fontWeight = FontWeight.Black, fontSize = 17.sp)
+                            Text("${w.races.first().time} → ${w.races.last().time} · 6 ayağın birincisini bulma oyunu", color = Muted, fontSize = 11.sp)
+                        }
+                    }
+                }
+                val coupons = buildSixliCoupons(w, experts)
+                coupons.forEachIndexed { ci, coupon ->
+                    item {
+                        Card(colors = CardDefaults.cardColors(containerColor = Surface), shape = RoundedCornerShape(20.dp), border = CardDefaults.outlinedCardBorder()) {
+                            Column(Modifier.fillMaxWidth().padding(16.dp)) {
+                                Row(verticalAlignment = Alignment.CenterVertically) {
+                                    Column(Modifier.weight(1f)) {
+                                        Text(coupon.name, fontWeight = FontWeight.Black, fontSize = 17.sp, color = Ink)
+                                        Text(coupon.subtitle, color = Muted, fontSize = 11.sp)
+                                    }
+                                    Surface(color = if (ci == 0) PaleGold else PaleGreen, shape = RoundedCornerShape(12.dp)) {
+                                        Text("${coupon.combinations} kombinasyon", modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp), color = if (ci == 0) Gold else Green, fontWeight = FontWeight.Bold, fontSize = 11.sp)
+                                    }
+                                }
+                                Spacer(Modifier.height(12.dp))
+                                coupon.legs.forEachIndexed { i, leg ->
+                                    val race = w.races[i]
+                                    val isSingle = leg.size == 1
+                                    Row(
+                                        Modifier.fillMaxWidth().clickable { onRace(race) }.padding(vertical = 6.dp),
+                                        verticalAlignment = Alignment.CenterVertically
+                                    ) {
+                                        Surface(color = if (isSingle) PaleGold else Bg, shape = RoundedCornerShape(10.dp)) {
+                                            Text("${i + 1}. AYAK", modifier = Modifier.padding(horizontal = 8.dp, vertical = 5.dp), fontWeight = FontWeight.Black, fontSize = 10.sp, color = if (isSingle) Gold else Ink)
+                                        }
+                                        Spacer(Modifier.width(10.dp))
+                                        Text(leg.joinToString(" - ") { it.horse.no.toString() }, modifier = Modifier.weight(1f), fontWeight = FontWeight.Black, color = Ink, fontSize = 15.sp)
+                                        if (isSingle) Text("TEK · ${leg.firstOrNull()?.score ?: 0}/100", color = Gold, fontWeight = FontWeight.Black, fontSize = 11.sp)
+                                    }
+                                }
+                                Spacer(Modifier.height(6.dp))
+                                Text("Koşuya dokunarak adayların gerekçelerini görebilirsin.", color = Muted, fontSize = 10.sp)
+                            }
+                        }
+                    }
+                }
+                item {
+                    Text("Not: 6’lı Ganyan, TJK’ya göre aynı gün belirlenen 6 koşunun birincilerini bulma oyunudur. Kuponlar tahmindir; kombinasyon sayısı seçilen at adetlerinin çarpımıdır.", color = Muted, fontSize = 10.sp, modifier = Modifier.padding(bottom = 24.dp))
+                }
+            }
+        }
+    }
+}
+
 @Composable
 private fun HistoryScreen(snapshots: List<HistorySnapshot>, onBack: () -> Unit, onOpen: (HistorySnapshot) -> Unit) {
     var nowTick by remember { mutableLongStateOf(System.currentTimeMillis()) }
@@ -1578,7 +1800,7 @@ private fun HistoryScreen(snapshots: List<HistorySnapshot>, onBack: () -> Unit, 
             IconButton(onClick=onBack){ Icon(Icons.Default.ArrowBack,"Geri") }
             Column { Text("Geçmiş",fontWeight=FontWeight.Black,fontSize=24.sp); Text("Yalnız bugün biten koşular · kayıtlı tahmin",color=Muted,fontSize=11.sp) }
         }
-        if(ended.isEmpty()) Box(Modifier.fillMaxSize(),contentAlignment=Alignment.Center){ Text("Bugün için kayıtlı bitmiş koşu yok.",color=Muted) }
+        if(ended.isEmpty()) Box(Modifier.fillMaxSize(),contentAlignment=Alignment.Center){ Text("Henüz bu kurulumda yarış öncesi kaydedilip biten koşu yok.",color=Muted) }
         else LazyColumn(Modifier.fillMaxSize(),contentPadding=PaddingValues(18.dp),verticalArrangement=Arrangement.spacedBy(10.dp)) {
             items(ended){ snap -> Card(Modifier.fillMaxWidth().clickable{onOpen(snap)},colors=CardDefaults.cardColors(containerColor=Surface),shape=RoundedCornerShape(16.dp)){
                 Row(Modifier.fillMaxWidth().padding(15.dp),verticalAlignment=Alignment.CenterVertically){ Column(Modifier.weight(1f)){Text("${snap.race.city} · ${snap.race.number}. Koşu",fontWeight=FontWeight.Black);Text("${snap.race.time} · Bitti · ${snap.picks.size} at",color=Muted,fontSize=11.sp)}; Text("Kayıtlı analiz ›",color=Green,fontWeight=FontWeight.Bold,fontSize=11.sp) }
@@ -1651,7 +1873,7 @@ private fun countdownText(seconds: Long): String {
 
 
 @Composable
-private fun TopHeader(onRefresh: () -> Unit, refreshing: Boolean, onHistory: () -> Unit) {
+private fun TopHeader(onRefresh: () -> Unit, refreshing: Boolean, onHistory: () -> Unit, onSixli: () -> Unit) {
     val compact = LocalConfiguration.current.screenWidthDp < 360
     Surface(color = Bg) {
         Row(
@@ -1682,6 +1904,7 @@ private fun TopHeader(onRefresh: () -> Unit, refreshing: Boolean, onHistory: () 
             Box {
                 IconButton(onClick = { menuOpen = true }, modifier = Modifier.size(44.dp)) { Icon(Icons.Default.MoreVert, "Menü", tint = Ink) }
                 DropdownMenu(expanded = menuOpen, onDismissRequest = { menuOpen = false }) {
+                    DropdownMenuItem(text = { Text("6’lı Kupon") }, onClick = { menuOpen = false; onSixli() })
                     DropdownMenuItem(text = { Text("Geçmiş") }, onClick = { menuOpen = false; onHistory() })
                 }
             }
@@ -1858,7 +2081,7 @@ private fun ScoreBadge(score: Int) {
 }
 
 @Composable
-fun RaceDetail(race: Race, expert: RaceExpertSignal?, onBack: () -> Unit) {
+fun RaceDetail(race: Race, expert: RaceExpertSignal?, expertsRefreshing: Boolean, onBack: () -> Unit) {
     val picks = remember(race, expert) { Predictor.picks(race, expert) }
     val surprise = picks.firstOrNull { it.label == "Sürpriz" } ?: picks.getOrNull(2)
     val compact = LocalConfiguration.current.screenWidthDp < 360
@@ -1899,7 +2122,7 @@ fun RaceDetail(race: Race, expert: RaceExpertSignal?, onBack: () -> Unit) {
             }
         }
         if (picks.isNotEmpty()) {
-            item { ExpertStatusCard(expert) }
+            item { ExpertStatusCard(expert, expertsRefreshing) }
             item { ResultHero(picks.first(), picks.getOrNull(1), surprise) }
             item { SectionTitle("Olası sıralama · tüm atlar") }
             items(picks, key = { it.horse.no }) { pick -> HorseCard(pick) }
@@ -1916,7 +2139,7 @@ fun RaceDetail(race: Race, expert: RaceExpertSignal?, onBack: () -> Unit) {
 }
 
 @Composable
-private fun ExpertStatusCard(expert: RaceExpertSignal?) {
+private fun ExpertStatusCard(expert: RaceExpertSignal?, loading: Boolean) {
     val configured = expert?.configuredSourceCount ?: 7
     val reachable = expert?.reachableSourceCount ?: 0
     val usable = expert?.sourceCount ?: 0
@@ -1931,11 +2154,32 @@ private fun ExpertStatusCard(expert: RaceExpertSignal?) {
             // Küçük telefonlarda sağdaki durum metni başlığı ezmesin: iki bağımsız satır.
             Text("Uzman verisi", fontWeight = FontWeight.Black, fontSize = 12.sp, color = Ink)
             Spacer(Modifier.height(3.dp))
-            Text(
-                "$reachable/$configured siteye ulaşıldı · $usable/$configured bu koşuda yorum bulundu",
-                color = if (usable > 0) Green else Muted, fontWeight = FontWeight.Bold, fontSize = 10.sp,
-                maxLines = 2, overflow = TextOverflow.Ellipsis
-            )
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                if (loading) {
+                    CircularProgressIndicator(
+                        modifier = Modifier.size(13.dp),
+                        strokeWidth = 2.dp,
+                        color = LoadingBlue
+                    )
+                } else {
+                    Icon(
+                        Icons.Default.CheckCircle,
+                        contentDescription = "Uzman taraması tamamlandı",
+                        tint = Green,
+                        modifier = Modifier.size(14.dp)
+                    )
+                }
+                Spacer(Modifier.width(6.dp))
+                Text(
+                    "$reachable/$configured siteye ulaşıldı · $usable/$configured bu koşuda yorum bulundu",
+                    color = if (usable > 0) Green else Muted, fontWeight = FontWeight.Bold, fontSize = 10.sp,
+                    maxLines = 2, overflow = TextOverflow.Ellipsis
+                )
+            }
+            if (loading) {
+                Spacer(Modifier.height(3.dp))
+                Text("Uzman kaynakları paralel taranıyor; sonuçlar geldikçe analiz güncellenir.", color = LoadingBlue, fontSize = 8.sp)
+            }
             if (reachable > 0) {
                 Spacer(Modifier.height(4.dp))
                 Text(

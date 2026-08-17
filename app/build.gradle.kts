@@ -12,8 +12,8 @@ android {
         applicationId = "com.yarisradar.app"
         minSdk = 26
         targetSdk = 35
-        versionCode = 50
-        versionName = "5.0.0"
+        versionCode = 55
+        versionName = "5.5.0"
     }
 
     compileOptions {
@@ -35,6 +35,7 @@ kotlin {
 dependencies {
     implementation(platform("androidx.compose:compose-bom:2024.12.01"))
     implementation("androidx.activity:activity-compose:1.10.0")
+    implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.8.7")
     implementation("androidx.compose.material3:material3")
     implementation("androidx.compose.material:material-icons-extended")
     implementation("androidx.compose.ui:ui")

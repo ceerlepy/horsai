@@ -1,14 +1,5 @@
-# Two Horse 5.0 FINAL
+# Two Horse 5.6 FINAL — 6'lı Kupon
 
-Final consolidated build.
+Adds an official-program-aware 6'lı Ganyan coupon screen with three model strategies: Dar, Dengeli, En Risksiz. The app discovers 6'lı start races from TJK program markers, uses current Predictor + expert signals for each of the six legs, and updates dynamically as expert data arrives.
 
-- Cache-first race program and cache-first expert signals; live refresh runs in background.
-- Expert source resilience: longer network timeouts, OkHttp connection retry, two HTTP attempts, alternate user agents, redirects, multi-URL candidates, link discovery and same-day cache fallback.
-- Source diagnostics distinguish reachable sites from sites whose current race section could not be validated.
-- Seven expert sources remain configured: HorseTurk, Banko Tahminler, Yıldızlı Bülten, Liderform, Yarış Dergisi, Ganyan Canavarı, Puanlı Altılı Bülten.
-- Safer race-section matching scores multiple candidate sections instead of blindly taking the first matching race number.
-- Expert display separates Support, Strong, ⭐ Favorite/Banko, Surprise and Negative signals.
-- Confidence weights: AGF 30, Expert 25, Form 15, HP 10, Market 10, Weight 5, Saha 5. Missing metrics are reweighted, not zeroed.
-- Responsive layout, system back navigation, daily immutable pre-race history, finished-race hiding and countdown timers preserved.
-- TJK last-three-video links remain date-sorted and non-runner entries are excluded.
-- Two Horse logo alignment adjusted.
+All prior 5.5 features are preserved.
