@@ -1,15 +1,15 @@
-# HorsAI 3.2 Final
+# Two Horse 4.0
 
-Türkiye at yarışları için mobil analiz arayüzü.
+Türkiye yarış programı için canlı TJK verisini kullanan Android uygulaması.
 
-## 3.2 güvenilirlik düzeltmeleri
-- TJK'ya onlarca paralel istek atmak yerine önce günün aktif Türkiye hipodromlarını keşfeder.
-- Resmi TJK YarisSever / Kurumsal / map sayfalarında otomatik fallback kullanır.
-- OkHttp timeout, retry ve HTTP doğrulaması eklendi.
-- TJK tablo başlıkları isimle eşlenir; sabit kolon indexi kullanılmaz.
-- At adı hücresindeki ekipman açıklamalarını ada karıştırmaz.
-- Yarış saatleri ve “sıradaki yarış” hesabı Europe/Istanbul saat diliminde yapılır.
-- Java/Kotlin JVM 17 uyumluluğu sabitlendi.
-- Ana ekranda sıradaki yarış + hızlı erişim, şehir filtreleri ve kupon özetleri korunur.
-
-> Not: TJK veya üçüncü taraf kaynak tamamen erişilemezse hiçbir istemci yüzde 100 canlı veri garantisi veremez. Uygulama bu durumda kontrollü hata ekranı gösterir ve yeniden denemeye izin verir.
+## 4.0 değişiklikleri
+- Uygulama adı ve marka: **Two Horse**
+- Siyah zemin üzerinde karşılıklı iki mavi at logosu
+- Status bar / kamera deliği çakışmalarına karşı safe-area düzeni
+- Detay ekranında hem üst geri butonu hem Android sistem geri tuşu/gesture desteği
+- Başlamış/biten koşular gösterilmez
+- En yakın yarışın şehri hızlı erişimde öne çıkar; o şehirden ilk 6 yaklaşan koşu görünür
+- Aynı şehrin 6'dan sonraki koşuları **Diğer kalan koşular** altında açılır/kapanır
+- Hızlı erişimde tamamen kapsanan şehir alt şehir listesinde tekrar edilmez
+- Detayda favori olsun olmasın yarıştaki bütün atlar puan ve yorumlarıyla listelenir
+- Küçük ekranlarda font/boşluk uyarlamaları ve navigation bar padding

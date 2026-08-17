@@ -2,7 +2,9 @@ package com.yarisradar.app
 
 import android.os.Bundle
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
@@ -14,6 +16,8 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.ArrowBack
 import androidx.compose.material.icons.filled.Bolt
 import androidx.compose.material.icons.filled.CloudOff
+import androidx.compose.material.icons.filled.KeyboardArrowDown
+import androidx.compose.material.icons.filled.KeyboardArrowUp
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Stars
 import androidx.compose.material3.*
@@ -22,10 +26,12 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.platform.LocalConfiguration
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
@@ -60,7 +66,7 @@ private val Border = Color(0xFFE1E7E3)
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        setContent { HorsAiApp() }
+        setContent { TwoHorseApp() }
     }
 }
 
@@ -188,7 +194,7 @@ object TjkRepository {
                 }
             }
         }
-        if (lastError != null) android.util.Log.w("HorsAI", "TJK fetch failed", lastError)
+        if (lastError != null) android.util.Log.w("TwoHorse", "TJK fetch failed", lastError)
         return null
     }
 
@@ -399,19 +405,28 @@ object Predictor {
             val normalized = if (maxRaw == minRaw) 70 else
                 (54 + ((item.second.first - minRaw) / (maxRaw - minRaw)) * 40).toInt().coerceIn(45, 94)
             val agf = item.first.agf ?: 0
+            val reasons = item.second.second.toMutableList()
+            if (reasons.isEmpty()) {
+                when {
+                    agf in 1..8 -> reasons += "AGF desteği sınırlı; sürpriz senaryosunda değerlendirilir"
+                    item.first.hp != null && item.first.hp < maxHp - 10 -> reasons += "HP rakiplerin gerisinde; yarış temposuna ihtiyaç duyabilir"
+                    item.first.weight != null && item.first.weight > minWeight + 3 -> reasons += "kilo dezavantajı var"
+                    else -> reasons += "belirgin üstünlük yok; yarış içi tempo ve pozisyon belirleyici"
+                }
+            }
             val label = when {
                 index == 0 -> "Favori"
                 index == 1 -> "Ciddi rakip"
                 agf <= 9 && normalized >= 60 -> "Sürpriz"
                 else -> "Alternatif"
             }
-            Pick(item.first, normalized, label, item.second.second.distinct().take(3))
+            Pick(item.first, normalized, label, reasons.distinct().take(3))
         }
     }
 }
 
 @Composable
-fun HorsAiApp() {
+fun TwoHorseApp() {
     MaterialTheme(
         colorScheme = lightColorScheme(
             primary = Green,
@@ -440,6 +455,8 @@ fun HorsAiApp() {
 
         LaunchedEffect(Unit) { refresh() }
 
+        BackHandler(enabled = selectedRace != null) { selectedRace = null }
+
         Surface(Modifier.fillMaxSize(), color = Bg) {
             selectedRace?.let { race ->
                 RaceDetail(race, onBack = { selectedRace = null })
@@ -457,6 +474,7 @@ fun Home(
     onRace: (Race) -> Unit
 ) {
     var selectedCity by remember(meetings) { mutableStateOf("Tümü") }
+    var otherExpanded by remember { mutableStateOf(false) }
     var nowTick by remember { mutableLongStateOf(System.currentTimeMillis()) }
     LaunchedEffect(Unit) {
         while (true) {
@@ -465,8 +483,7 @@ fun Home(
         }
     }
 
-    // Yalnızca henüz başlamamış koşular uygulamada görünür. Sayaç sıfıra
-    // ulaştığı anda koşu listeden ve şehir filtresinden otomatik kalkar.
+    // Başlamış/biten koşular hiçbir ekranda tekrar gösterilmez.
     val activeMeetings = remember(meetings, nowTick) {
         meetings.mapNotNull { meeting ->
             val futureRaces = meeting.races
@@ -475,40 +492,97 @@ fun Home(
             if (futureRaces.isEmpty()) null else meeting.copy(races = futureRaces)
         }
     }
-    val cities = remember(activeMeetings) { listOf("Tümü") + activeMeetings.map { it.city }.distinct() }
+    val allUpcoming = remember(activeMeetings, nowTick) {
+        activeMeetings.flatMap { it.races }.sortedBy { secondsUntil(it.time, nowTick) }
+    }
+
+    // Hızlı erişim tek bir şehir içindir: o anda Türkiye'deki EN YAKIN koşunun şehri.
+    // O şehrin ilk 6 yaklaşan koşusu üstte, fazlası collapsible bölümde görünür.
+    val leadCity = allUpcoming.firstOrNull()?.city
+    val leadMeeting = activeMeetings.firstOrNull { it.city == leadCity }
+    val leadRaces = leadMeeting?.races.orEmpty().sortedBy { secondsUntil(it.time, nowTick) }
+    val quickRaces = leadRaces.take(6)
+    val overflowLeadRaces = leadRaces.drop(6)
+
+    // Üst blokta bir şehrin tüm kalan koşuları zaten kapsandığından aşağıda tekrar etmiyoruz.
+    val lowerMeetings = activeMeetings.filter { it.city != leadCity }
+    val cities = remember(lowerMeetings) { listOf("Tümü") + lowerMeetings.map { it.city }.distinct() }
     LaunchedEffect(cities) {
         if (selectedCity !in cities) selectedCity = "Tümü"
     }
-    val upcoming = remember(activeMeetings, nowTick) {
-        activeMeetings.flatMap { it.races }.sortedBy { secondsUntil(it.time, nowTick) }
-    }
-    val visibleMeetings = if (selectedCity == "Tümü") activeMeetings else activeMeetings.filter { it.city == selectedCity }
-    val activeRaceCount = activeMeetings.sumOf { it.races.size }
+    LaunchedEffect(leadCity) { otherExpanded = false }
+
+    val visibleMeetings = if (selectedCity == "Tümü") lowerMeetings else lowerMeetings.filter { it.city == selectedCity }
+    val lowerRaceCount = lowerMeetings.sumOf { it.races.size }
 
     Column(Modifier.fillMaxSize()) {
         TopHeader(onRefresh)
         when {
             loading -> LoadingState()
             meetings.isEmpty() -> EmptyState(error, onRefresh)
+            allUpcoming.isEmpty() -> LazyColumn(
+                modifier = Modifier.fillMaxSize().navigationBarsPadding(),
+                contentPadding = PaddingValues(start = 18.dp, end = 18.dp, bottom = 28.dp)
+            ) { item { NextRaceHero(null, nowTick, onRace) } }
             else -> LazyColumn(
-                modifier = Modifier.fillMaxSize(),
-                contentPadding = PaddingValues(start = 18.dp, end = 18.dp, bottom = 40.dp),
+                modifier = Modifier.fillMaxSize().navigationBarsPadding(),
+                contentPadding = PaddingValues(start = 18.dp, end = 18.dp, bottom = 32.dp),
                 verticalArrangement = Arrangement.spacedBy(12.dp)
             ) {
-                item { NextRaceHero(upcoming.firstOrNull(), nowTick, onRace) }
-                if (upcoming.isNotEmpty()) {
-                    if (upcoming.size > 1) {
-                        item { SectionHeader("Sıradaki yarışlar", "Zamana göre en yakın") }
-                        items(upcoming.drop(1).take(4)) { race -> UpcomingRaceCard(race, nowTick, onRace) }
+                item { NextRaceHero(quickRaces.firstOrNull(), nowTick, onRace) }
+
+                if (quickRaces.size > 1) {
+                    item { SectionHeader("Sıradaki yarışlar", "${leadCity.orEmpty()} · en yakın 6") }
+                    items(quickRaces.drop(1)) { race -> UpcomingRaceCard(race, nowTick, onRace) }
+                }
+
+                if (overflowLeadRaces.isNotEmpty()) {
+                    item {
+                        RemainingRacesToggle(
+                            count = overflowLeadRaces.size,
+                            expanded = otherExpanded,
+                            onToggle = { otherExpanded = !otherExpanded }
+                        )
                     }
+                    if (otherExpanded) {
+                        items(overflowLeadRaces) { race -> UpcomingRaceCard(race, nowTick, onRace) }
+                    }
+                }
+
+                if (lowerMeetings.isNotEmpty()) {
                     item { CityFilter(cities, selectedCity) { selectedCity = it } }
-                    item { SectionHeader("Kalan yarışlar", "$activeRaceCount koşu · ${activeMeetings.size} şehir") }
+                    item { SectionHeader("Diğer şehirler", "$lowerRaceCount koşu · ${lowerMeetings.size} şehir") }
                     visibleMeetings.forEach { meeting ->
                         item { MeetingHeader(meeting) }
                         items(meeting.races) { race -> RaceCard(race, nowTick, onRace) }
                     }
                 }
             }
+        }
+    }
+}
+
+@Composable
+private fun RemainingRacesToggle(count: Int, expanded: Boolean, onToggle: () -> Unit) {
+    Card(
+        modifier = Modifier.fillMaxWidth().clickable { onToggle() },
+        colors = CardDefaults.cardColors(containerColor = Surface),
+        shape = RoundedCornerShape(18.dp),
+        border = CardDefaults.outlinedCardBorder()
+    ) {
+        Row(
+            Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 14.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Column(Modifier.weight(1f)) {
+                Text("Diğer kalan koşular", color = Ink, fontWeight = FontWeight.Black, fontSize = 14.sp)
+                Text("$count yaklaşan koşu", color = Muted, fontSize = 11.sp)
+            }
+            Icon(
+                if (expanded) Icons.Default.KeyboardArrowUp else Icons.Default.KeyboardArrowDown,
+                contentDescription = if (expanded) "Kapat" else "Aç",
+                tint = Ink
+            )
         }
     }
 }
@@ -541,27 +615,35 @@ private fun countdownText(seconds: Long): String {
 
 @Composable
 private fun TopHeader(onRefresh: () -> Unit) {
+    val compact = LocalConfiguration.current.screenWidthDp < 360
     Surface(color = Bg) {
         Row(
-            Modifier.fillMaxWidth().padding(start = 20.dp, end = 10.dp, top = 14.dp, bottom = 10.dp),
+            Modifier
+                .fillMaxWidth()
+                .statusBarsPadding()
+                .padding(start = 18.dp, end = 8.dp, top = 8.dp, bottom = 10.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
-            Box(
-                Modifier.size(48.dp).clip(RoundedCornerShape(16.dp)).background(Ink),
-                contentAlignment = Alignment.Center
-            ) { Text("HA", color = Gold, fontWeight = FontWeight.Black, fontSize = 16.sp) }
+            Image(
+                painter = painterResource(id = R.drawable.two_horse_logo),
+                contentDescription = "Two Horse",
+                modifier = Modifier.size(if (compact) 46.dp else 52.dp).clip(RoundedCornerShape(16.dp))
+            )
             Spacer(Modifier.width(12.dp))
             Column(Modifier.weight(1f)) {
-                Text("HorsAI", fontWeight = FontWeight.Black, fontSize = 26.sp, color = Ink)
-                Text("Türkiye yarış analizi", color = Muted, fontSize = 12.sp)
+                Text("Two Horse", fontWeight = FontWeight.Black, fontSize = if (compact) 23.sp else 27.sp, color = Ink, maxLines = 1)
+                Text("Türkiye yarış analizi", color = Muted, fontSize = 12.sp, maxLines = 1)
             }
-            IconButton(onClick = onRefresh) { Icon(Icons.Default.Refresh, "Yenile", tint = Ink) }
+            IconButton(onClick = onRefresh, modifier = Modifier.size(48.dp)) {
+                Icon(Icons.Default.Refresh, "Yenile", tint = Ink)
+            }
         }
     }
 }
 
 @Composable
 private fun NextRaceHero(race: Race?, nowTick: Long, onRace: (Race) -> Unit) {
+    val compact = LocalConfiguration.current.screenWidthDp < 360
     Card(
         Modifier.fillMaxWidth().padding(top = 8.dp),
         colors = CardDefaults.cardColors(containerColor = Ink),
@@ -586,7 +668,7 @@ private fun NextRaceHero(race: Race?, nowTick: Long, onRace: (Race) -> Unit) {
                 Spacer(Modifier.height(18.dp))
                 Text("Sıradaki yarış", color = Color.White.copy(.58f), fontSize = 12.sp, fontWeight = FontWeight.Bold)
                 Spacer(Modifier.height(4.dp))
-                Text("${race.city} · ${race.number}. Koşu", color = Color.White, fontWeight = FontWeight.Black, fontSize = 27.sp)
+                Text("${race.city} · ${race.number}. Koşu", color = Color.White, fontWeight = FontWeight.Black, fontSize = if (compact) 23.sp else 27.sp)
                 Spacer(Modifier.height(5.dp))
                 Text(listOf(race.distance.takeIf { it.isNotBlank() }?.plus(" m"), race.surface).filterNotNull().joinToString(" · "), color = Color.White.copy(.68f), fontSize = 13.sp)
                 Spacer(Modifier.height(18.dp))
@@ -603,6 +685,7 @@ private fun NextRaceHero(race: Race?, nowTick: Long, onRace: (Race) -> Unit) {
 
 @Composable
 private fun UpcomingRaceCard(race: Race, nowTick: Long, onRace: (Race) -> Unit) {
+    val compact = LocalConfiguration.current.screenWidthDp < 360
     val picks = remember(race) { Predictor.picks(race) }
     val favorite = picks.firstOrNull()
     val secs = secondsUntil(race.time, nowTick)
@@ -613,8 +696,8 @@ private fun UpcomingRaceCard(race: Race, nowTick: Long, onRace: (Race) -> Unit) 
         border = CardDefaults.outlinedCardBorder()
     ) {
         Row(Modifier.padding(15.dp), verticalAlignment = Alignment.CenterVertically) {
-            Column(Modifier.width(70.dp)) {
-                Text(race.time, fontWeight = FontWeight.Black, fontSize = 18.sp, color = Ink)
+            Column(Modifier.width(if (compact) 62.dp else 70.dp)) {
+                Text(race.time, fontWeight = FontWeight.Black, fontSize = if (compact) 16.sp else 18.sp, color = Ink)
                 Text(countdownText(secs), color = Green, fontWeight = FontWeight.Bold, fontSize = 11.sp)
             }
             Box(Modifier.width(1.dp).height(44.dp).background(Border))
@@ -730,24 +813,47 @@ private fun ScoreBadge(score: Int) {
 fun RaceDetail(race: Race, onBack: () -> Unit) {
     val picks = remember(race) { Predictor.picks(race) }
     val surprise = picks.firstOrNull { it.label == "Sürpriz" } ?: picks.getOrNull(2)
+    val compact = LocalConfiguration.current.screenWidthDp < 360
+
+    BackHandler(onBack = onBack)
+
     LazyColumn(
-        Modifier.fillMaxSize(),
-        contentPadding = PaddingValues(start = 18.dp, end = 18.dp, bottom = 42.dp),
+        Modifier.fillMaxSize().navigationBarsPadding(),
+        contentPadding = PaddingValues(start = if (compact) 12.dp else 18.dp, end = if (compact) 12.dp else 18.dp, bottom = 36.dp),
         verticalArrangement = Arrangement.spacedBy(12.dp)
     ) {
         item {
-            Row(Modifier.padding(top = 10.dp), verticalAlignment = Alignment.CenterVertically) {
-                IconButton(onClick = onBack) { Icon(Icons.Default.ArrowBack, "Geri") }
+            Row(
+                Modifier
+                    .fillMaxWidth()
+                    .statusBarsPadding()
+                    .padding(top = 4.dp, bottom = 4.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                IconButton(onClick = onBack, modifier = Modifier.size(48.dp)) {
+                    Icon(Icons.Default.ArrowBack, "Geri")
+                }
+                Spacer(Modifier.width(2.dp))
                 Column(Modifier.weight(1f)) {
-                    Text("${race.number}. Koşu · ${race.time}", fontWeight = FontWeight.Black, fontSize = 22.sp)
-                    Text(listOf(race.distance.takeIf { it.isNotBlank() }?.plus(" m"), race.surface).filterNotNull().joinToString(" · "), color = Muted, fontSize = 12.sp)
+                    Text(
+                        "${race.city} · ${race.number}. Koşu · ${race.time}",
+                        fontWeight = FontWeight.Black,
+                        fontSize = if (compact) 18.sp else 21.sp,
+                        maxLines = 2
+                    )
+                    Text(
+                        listOf(race.distance.takeIf { it.isNotBlank() }?.plus(" m"), race.surface)
+                            .filterNotNull().joinToString(" · "),
+                        color = Muted,
+                        fontSize = 12.sp
+                    )
                 }
             }
         }
         if (picks.isNotEmpty()) {
             item { ResultHero(picks.first(), surprise) }
-            item { SectionTitle("Olası sıralama") }
-            items(picks) { pick -> HorseCard(pick) }
+            item { SectionTitle("Olası sıralama · tüm atlar") }
+            items(picks, key = { it.horse.no }) { pick -> HorseCard(pick) }
             item {
                 SectionTitle("Kuponlar")
                 CouponRow("Dar", picks.take(min(2, picks.size)).joinToString(" – ") { it.horse.no.toString() }, "Yüksek risk")
@@ -758,7 +864,11 @@ fun RaceDetail(race: Race, onBack: () -> Unit) {
             }
         }
         item {
-            Text("Model; TJK programındaki AGF, HP, kilo, ganyan, son form ve pist/mesafe verilerini birlikte puanlar. Tahmin garanti değildir.", color = Muted, fontSize = 11.sp)
+            Text(
+                "Model; TJK programındaki AGF, HP, kilo, ganyan, son form ve pist/mesafe verilerini birlikte puanlar. Tüm koşan atlar listelenir; tahmin garanti değildir.",
+                color = Muted,
+                fontSize = 11.sp
+            )
         }
     }
 }

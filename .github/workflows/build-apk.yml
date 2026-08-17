@@ -29,6 +29,6 @@ jobs:
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: horsai-debug-apk
+          name: two-horse-debug-apk
           path: app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: error

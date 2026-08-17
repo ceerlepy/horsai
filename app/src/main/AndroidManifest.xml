@@ -2,8 +2,9 @@
     <uses-permission android:name="android.permission.INTERNET" />
     <application
         android:allowBackup="true"
-        android:label="HorsAI"
+        android:label="@string/app_name"
         android:theme="@style/Theme.YarisRadar"
+        android:icon="@drawable/two_horse_logo"
         android:usesCleartextTraffic="false">
         <activity
             android:name=".MainActivity"
