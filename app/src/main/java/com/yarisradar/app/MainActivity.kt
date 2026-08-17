@@ -21,6 +21,7 @@ import androidx.compose.material.icons.filled.Bolt
 import androidx.compose.material.icons.filled.CloudOff
 import androidx.compose.material.icons.filled.KeyboardArrowDown
 import androidx.compose.material.icons.filled.KeyboardArrowUp
+import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Stars
@@ -202,6 +203,65 @@ object VideoRepository {
             links.take(3)
         } ?: emptyList()
     }
+}
+
+data class HistorySnapshot(val race: Race, val picks: List<Pick>)
+
+object HistoryStore {
+    private const val PREF = "two_horse_history_v1"
+    private const val KEY_DATE = "date"
+    private const val KEY_DATA = "snapshots"
+
+    private fun today(): String = SimpleDateFormat("dd/MM/yyyy", Locale.US).apply {
+        timeZone = java.util.TimeZone.getTimeZone("Europe/Istanbul")
+    }.format(Date())
+
+    fun capture(context: Context, meetings: List<Meeting>, experts: Map<String, RaceExpertSignal>) {
+        if (meetings.isEmpty()) return
+        val prefs = context.getSharedPreferences(PREF, Context.MODE_PRIVATE)
+        val day = today()
+        val root = if (prefs.getString(KEY_DATE, null) == day) {
+            runCatching { JSONObject(prefs.getString(KEY_DATA, "{}") ?: "{}") }.getOrDefault(JSONObject())
+        } else JSONObject()
+        meetings.flatMap { it.races }.forEach { race ->
+            val key = raceKey(race)
+            // Snapshot is immutable: once captured, later odds/results cannot rewrite the old prediction.
+            if (!root.has(key)) {
+                val picks = Predictor.picks(race, experts[key])
+                if (picks.isNotEmpty()) root.put(key, snapshotToJson(HistorySnapshot(race, picks)))
+            }
+        }
+        prefs.edit().putString(KEY_DATE, day).putString(KEY_DATA, root.toString()).apply()
+    }
+
+    fun load(context: Context): List<HistorySnapshot> {
+        val prefs = context.getSharedPreferences(PREF, Context.MODE_PRIVATE)
+        if (prefs.getString(KEY_DATE, null) != today()) {
+            prefs.edit().clear().apply()
+            return emptyList()
+        }
+        val root = runCatching { JSONObject(prefs.getString(KEY_DATA, "{}") ?: "{}") }.getOrDefault(JSONObject())
+        return root.keys().asSequence().mapNotNull { key -> runCatching { snapshotFromJson(root.getJSONObject(key)) }.getOrNull() }.toList()
+    }
+
+    private fun horseToJson(h: Horse) = JSONObject().apply {
+        put("no",h.no); put("name",h.name); h.weight?.let{put("weight",it)}; put("jockey",h.jockey)
+        h.hp?.let{put("hp",it)}; put("last6",h.last6); put("best",h.best); h.odds?.let{put("odds",it)}
+        h.agf?.let{put("agf",it)}; h.start?.let{put("start",it)}; put("videoUrl",h.videoUrl?:""); put("detailUrl",h.detailUrl?:"")
+    }
+    private fun horseFromJson(o: JSONObject)=Horse(o.getInt("no"),o.getString("name"),o.optDoubleN("weight"),o.optString("jockey"),o.optIntN("hp"),o.optString("last6"),o.optString("best"),o.optDoubleN("odds"),o.optIntN("agf"),o.optIntN("start"),o.optString("videoUrl").takeIf{it.isNotBlank()},o.optString("detailUrl").takeIf{it.isNotBlank()})
+    private fun raceToJson(r: Race)=JSONObject().apply { put("number",r.number);put("time",r.time);put("title",r.title);put("distance",r.distance);put("surface",r.surface);put("city",r.city);put("horses",JSONArray().apply{r.horses.forEach{put(horseToJson(it))}}) }
+    private fun raceFromJson(o:JSONObject):Race { val a=o.getJSONArray("horses"); val hs=(0 until a.length()).map{horseFromJson(a.getJSONObject(it))}; return Race(o.getInt("number"),o.getString("time"),o.optString("title"),o.optString("distance"),o.optString("surface"),hs,o.optString("city")) }
+    private fun pickToJson(p:Pick)=JSONObject().apply {
+        put("horse",horseToJson(p.horse));put("score",p.score);put("label",p.label);put("reasons",JSONArray(p.reasons)); p.agfRank?.let{put("agfRank",it)};p.hpRank?.let{put("hpRank",it)};p.expertRank?.let{put("expertRank",it)}
+        put("expertSupport",p.expertSupport);put("expertTotal",p.expertTotal);put("expertSources",JSONArray(p.expertSources));put("expertStrong",p.expertStrong);put("expertSurprise",p.expertSurprise);put("expertNegative",p.expertNegative);put("sahaScore",p.sahaScore);put("sahaNotes",JSONArray(p.sahaNotes));put("marketLabel",p.marketLabel);put("formLabel",p.formLabel)
+    }
+    private fun strings(a:JSONArray)= (0 until a.length()).map{a.optString(it)}
+    private fun pickFromJson(o:JSONObject)=Pick(horseFromJson(o.getJSONObject("horse")),o.getInt("score"),o.getString("label"),strings(o.getJSONArray("reasons")),o.optIntN("agfRank"),o.optIntN("hpRank"),o.optIntN("expertRank"),o.optInt("expertSupport"),o.optInt("expertTotal"),strings(o.optJSONArray("expertSources")?:JSONArray()),o.optInt("expertStrong"),o.optInt("expertSurprise"),o.optInt("expertNegative"),o.optInt("sahaScore"),strings(o.optJSONArray("sahaNotes")?:JSONArray()),o.optString("marketLabel","Belirsiz"),o.optString("formLabel","→ Dengeli"))
+    private fun snapshotToJson(s:HistorySnapshot)=JSONObject().apply{put("race",raceToJson(s.race));put("picks",JSONArray().apply{s.picks.forEach{put(pickToJson(it))}})}
+    private fun snapshotFromJson(o:JSONObject):HistorySnapshot { val a=o.getJSONArray("picks"); return HistorySnapshot(raceFromJson(o.getJSONObject("race")),(0 until a.length()).map{pickFromJson(a.getJSONObject(it))}) }
+    private fun JSONObject.optIntN(k:String):Int?=if(has(k)&&!isNull(k)) getInt(k) else null
+    private fun JSONObject.optDoubleN(k:String):Double?=if(has(k)&&!isNull(k)) getDouble(k) else null
 }
 
 object MeetingCache {
@@ -1017,7 +1077,7 @@ object Predictor {
             }
 
             h.agf?.let {
-                addComponent(it.toDouble() / maxAgf, 28.0)
+                addComponent(it.toDouble() / maxAgf, 25.0)
                 if (it >= 18) reasons += "AGF desteği yüksek"
             }
             h.hp?.let {
@@ -1034,7 +1094,7 @@ object Predictor {
                 if (o <= minOdds * 1.6) reasons += "piyasa desteği"
             }
             val fScore = formScore(h.last6)
-            if (h.last6.isNotBlank()) addComponent(fScore / maxFormScore, 20.0)
+            if (h.last6.isNotBlank()) addComponent(fScore / maxFormScore, 18.0)
             if (formLabel(h.last6).contains("Yükseliyor") || formLabel(h.last6).contains("Formda")) reasons += "yakın formu olumlu"
             if (h.best.isNotBlank()) reasons += "pist/mesafe derecesi var"
 
@@ -1045,7 +1105,7 @@ object Predictor {
                 val surpriseRatio = ex.surpriseSupport.toDouble() / ex.totalSources
                 val negativeRatio = ex.negativeSupport.toDouble() / ex.totalSources
                 val expertValue = (ratio * .62 + strongRatio * .28 + surpriseRatio * .08 - negativeRatio * .38).coerceIn(0.0, 1.0)
-                addComponent(expertValue, 17.0)
+                addComponent(expertValue, 22.0)
                 if (ex.sahaNotes.isNotEmpty()) {
                     val sahaValue = ((ex.sahaScore.coerceIn(-4, 6) + 4).toDouble() / 10.0)
                     addComponent(sahaValue, 5.0)
@@ -1133,6 +1193,8 @@ fun TwoHorseApp() {
         var refreshing by remember { mutableStateOf(false) }
         var error by remember { mutableStateOf<String?>(null) }
         var selectedRace by remember { mutableStateOf<Race?>(null) }
+        var historyOpen by remember { mutableStateOf(false) }
+        var selectedHistory by remember { mutableStateOf<HistorySnapshot?>(null) }
         val scope = rememberCoroutineScope()
 
         fun refresh() {
@@ -1156,24 +1218,23 @@ fun TwoHorseApp() {
         LaunchedEffect(Unit) { refresh() }
         LaunchedEffect(meetings) {
             if (meetings.isNotEmpty()) {
-                expertSignals = ExpertRepository.load(context, meetings)
+                val loadedExperts = ExpertRepository.load(context, meetings)
+                expertSignals = loadedExperts
+                HistoryStore.capture(context, meetings, loadedExperts)
             }
         }
 
-        BackHandler(enabled = selectedRace != null) { selectedRace = null }
+        BackHandler(enabled = selectedRace != null || selectedHistory != null || historyOpen) {
+            when { selectedRace != null -> selectedRace = null; selectedHistory != null -> selectedHistory = null; historyOpen -> historyOpen = false }
+        }
 
         Surface(Modifier.fillMaxSize(), color = Bg) {
-            selectedRace?.let { race ->
-                RaceDetail(race, expertSignals[raceKey(race)], onBack = { selectedRace = null })
-            } ?: Home(
-                meetings = meetings,
-                experts = expertSignals,
-                loading = loading,
-                refreshing = refreshing,
-                error = error,
-                onRefresh = ::refresh,
-                onRace = { selectedRace = it }
-            )
+            when {
+                selectedRace != null -> RaceDetail(selectedRace!!, expertSignals[raceKey(selectedRace!!)], onBack = { selectedRace = null })
+                selectedHistory != null -> HistoryDetail(selectedHistory!!, onBack = { selectedHistory = null })
+                historyOpen -> HistoryScreen(HistoryStore.load(context), onBack = { historyOpen = false }, onOpen = { selectedHistory = it })
+                else -> Home(meetings, expertSignals, loading, refreshing, error, ::refresh, { selectedRace = it }, { historyOpen = true })
+            }
         }
     }
 }
@@ -1186,7 +1247,8 @@ fun Home(
     refreshing: Boolean,
     error: String?,
     onRefresh: () -> Unit,
-    onRace: (Race) -> Unit
+    onRace: (Race) -> Unit,
+    onHistory: () -> Unit
 ) {
     var selectedCity by remember(meetings) { mutableStateOf("Tümü") }
     var otherExpanded by remember { mutableStateOf(false) }
@@ -1231,7 +1293,7 @@ fun Home(
     val lowerRaceCount = lowerMeetings.sumOf { it.races.size }
 
     Column(Modifier.fillMaxSize()) {
-        TopHeader(onRefresh, refreshing)
+        TopHeader(onRefresh, refreshing, onHistory)
         when {
             loading -> LoadingState()
             meetings.isEmpty() -> EmptyState(error, onRefresh)
@@ -1273,6 +1335,37 @@ fun Home(
                     }
                 }
             }
+        }
+    }
+}
+
+@Composable
+private fun HistoryScreen(snapshots: List<HistorySnapshot>, onBack: () -> Unit, onOpen: (HistorySnapshot) -> Unit) {
+    var nowTick by remember { mutableLongStateOf(System.currentTimeMillis()) }
+    LaunchedEffect(Unit) { while(true){ delay(1000); nowTick=System.currentTimeMillis() } }
+    val ended = remember(snapshots, nowTick) { snapshots.filter { secondsUntil(it.race.time, nowTick) <= 0L }.sortedByDescending { it.race.time } }
+    Column(Modifier.fillMaxSize().statusBarsPadding()) {
+        Row(Modifier.fillMaxWidth().padding(8.dp), verticalAlignment=Alignment.CenterVertically) {
+            IconButton(onClick=onBack){ Icon(Icons.Default.ArrowBack,"Geri") }
+            Column { Text("Geçmiş",fontWeight=FontWeight.Black,fontSize=24.sp); Text("Yalnız bugün biten koşular · kayıtlı tahmin",color=Muted,fontSize=11.sp) }
+        }
+        if(ended.isEmpty()) Box(Modifier.fillMaxSize(),contentAlignment=Alignment.Center){ Text("Bugün için kayıtlı bitmiş koşu yok.",color=Muted) }
+        else LazyColumn(Modifier.fillMaxSize(),contentPadding=PaddingValues(18.dp),verticalArrangement=Arrangement.spacedBy(10.dp)) {
+            items(ended){ snap -> Card(Modifier.fillMaxWidth().clickable{onOpen(snap)},colors=CardDefaults.cardColors(containerColor=Surface),shape=RoundedCornerShape(16.dp)){
+                Row(Modifier.fillMaxWidth().padding(15.dp),verticalAlignment=Alignment.CenterVertically){ Column(Modifier.weight(1f)){Text("${snap.race.city} · ${snap.race.number}. Koşu",fontWeight=FontWeight.Black);Text("${snap.race.time} · Bitti · ${snap.picks.size} at",color=Muted,fontSize=11.sp)}; Text("Kayıtlı analiz ›",color=Green,fontWeight=FontWeight.Bold,fontSize=11.sp) }
+            }}
+        }
+    }
+}
+
+@Composable
+private fun HistoryDetail(snapshot: HistorySnapshot, onBack: () -> Unit) {
+    val race=snapshot.race
+    Column(Modifier.fillMaxSize().statusBarsPadding()) {
+        Row(Modifier.fillMaxWidth().padding(8.dp),verticalAlignment=Alignment.CenterVertically){IconButton(onClick=onBack){Icon(Icons.Default.ArrowBack,"Geri")};Column{Text("${race.city} · ${race.number}. Koşu",fontWeight=FontWeight.Black,fontSize=20.sp);Text("Yarış öncesi kaydedilmiş analiz · yeniden hesaplanmadı",color=Muted,fontSize=10.sp)}}
+        LazyColumn(Modifier.fillMaxSize(),contentPadding=PaddingValues(18.dp),verticalArrangement=Arrangement.spacedBy(10.dp)){
+            item { Text("Kayıtlı sıralama",fontWeight=FontWeight.Black,fontSize=18.sp) }
+            items(snapshot.picks){ HorseCard(it) }
         }
     }
 }
@@ -1329,7 +1422,7 @@ private fun countdownText(seconds: Long): String {
 
 
 @Composable
-private fun TopHeader(onRefresh: () -> Unit, refreshing: Boolean) {
+private fun TopHeader(onRefresh: () -> Unit, refreshing: Boolean, onHistory: () -> Unit) {
     val compact = LocalConfiguration.current.screenWidthDp < 360
     Surface(color = Bg) {
         Row(
@@ -1349,8 +1442,13 @@ private fun TopHeader(onRefresh: () -> Unit, refreshing: Boolean) {
                 Text("Two Horse", fontWeight = FontWeight.Black, fontSize = if (compact) 23.sp else 27.sp, color = Ink, maxLines = 1)
                 Text(if (refreshing) "Canlı veri güncelleniyor…" else "Türkiye yarış analizi", color = Muted, fontSize = 12.sp, maxLines = 1)
             }
-            IconButton(onClick = onRefresh, modifier = Modifier.size(48.dp)) {
-                Icon(Icons.Default.Refresh, "Yenile", tint = Ink)
+            IconButton(onClick = onRefresh, modifier = Modifier.size(44.dp)) { Icon(Icons.Default.Refresh, "Yenile", tint = Ink) }
+            var menuOpen by remember { mutableStateOf(false) }
+            Box {
+                IconButton(onClick = { menuOpen = true }, modifier = Modifier.size(44.dp)) { Icon(Icons.Default.MoreVert, "Menü", tint = Ink) }
+                DropdownMenu(expanded = menuOpen, onDismissRequest = { menuOpen = false }) {
+                    DropdownMenuItem(text = { Text("Geçmiş") }, onClick = { menuOpen = false; onHistory() })
+                }
             }
         }
     }
@@ -1581,7 +1679,7 @@ fun RaceDetail(race: Race, expert: RaceExpertSignal?, onBack: () -> Unit) {
         }
         item {
             Text(
-                "Güven puanı; AGF %28, HP %15, form %20, uzman %17, ganyan/piyasa %10, kilo %5 ve saha %5 ağırlıklarıyla hesaplanır. Eksik veri varsa o bileşen atı otomatik cezalandırmaz; mevcut bileşenlerin ağırlığı yeniden dengelenir. Uzman siteleri yanıt vermezse uygulama onları beklemeden TJK verisiyle çalışmaya devam eder. Tahmin garanti değildir.",
+                "Güven puanı; AGF %25, HP %15, form %18, uzman %22, ganyan/piyasa %10, kilo %5 ve saha %5 ağırlıklarıyla hesaplanır. Eksik veri varsa o bileşen atı otomatik cezalandırmaz; mevcut bileşenlerin ağırlığı yeniden dengelenir. Uzman siteleri yanıt vermezse uygulama onları beklemeden TJK verisiyle çalışmaya devam eder. Tahmin garanti değildir.",
                 color = Muted,
                 fontSize = 11.sp
             )
