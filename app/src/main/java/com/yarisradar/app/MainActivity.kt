@@ -90,7 +90,8 @@ data class Horse(
     val odds: Double? = null,
     val agf: Int? = null,
     val start: Int? = null,
-    val videoUrl: String? = null
+    val videoUrl: String? = null,
+    val detailUrl: String? = null
 )
 
 data class Race(
@@ -165,28 +166,34 @@ object VideoRepository {
     }
 
     suspend fun loadLast3(startUrl: String): List<RaceVideo> = withContext(Dispatchers.IO) {
-        withTimeoutOrNull(8500) {
-            runCatching {
-                val req = okhttp3.Request.Builder().url(startUrl)
+        withTimeoutOrNull(9000) {
+            suspend fun fetch(url: String): Document? = runCatching {
+                val req = okhttp3.Request.Builder().url(url)
                     .header("User-Agent", "Mozilla/5.0 (Linux; Android 15; Mobile) AppleWebKit/537.36 Chrome/140 Mobile Safari/537.36")
                     .header("Accept-Language", "tr-TR,tr;q=0.9")
                     .build()
                 client.newCall(req).execute().use { r ->
-                    if (!r.isSuccessful) {
-                        emptyList()
-                    } else {
-                        val html = r.body?.string().orEmpty()
-                        val doc = Jsoup.parse(html, r.request.url.toString())
-                        val links = doc.select("a[href]").mapNotNull { a ->
-                            val href = a.attr("abs:href").ifBlank { a.attr("href") }
-                            if (!href.contains("YarisVideo", true)) return@mapNotNull null
-                            val label = a.text().replace(Regex("\\s+"), " ").trim()
-                            RaceVideo(label.ifBlank { "TJK yarış videosu" }, href)
-                        }.distinctBy { it.url }
-                        if (links.isNotEmpty()) links.take(3) else listOf(RaceVideo("TJK video arşivi", startUrl))
-                    }
+                    if (!r.isSuccessful) null else Jsoup.parse(r.body?.string().orEmpty(), r.request.url.toString())
                 }
-            }.getOrDefault(emptyList())
+            }.getOrNull()
+
+            fun videoLinks(doc: Document): List<RaceVideo> = doc.select("a[href]").mapNotNull { a ->
+                val href = a.attr("abs:href").ifBlank { a.attr("href") }
+                if (!href.contains("YarisVideoAt", true)) return@mapNotNull null
+                val label = a.text().replace(Regex("\\s+"), " ").trim()
+                RaceVideo(label.ifBlank { "TJK yarış videosu" }, href)
+            }.distinctBy { it.url }
+
+            val firstDoc = fetch(startUrl) ?: return@withTimeoutOrNull emptyList()
+            var links = videoLinks(firstDoc)
+            if (!startUrl.contains("YarisVideoAt", true)) {
+                val archive = links.firstOrNull()?.url
+                if (archive != null) {
+                    val archiveDoc = fetch(archive)
+                    if (archiveDoc != null) links = videoLinks(archiveDoc).ifEmpty { links }
+                }
+            }
+            links.take(3)
         } ?: emptyList()
     }
 }
@@ -226,7 +233,8 @@ object MeetingCache {
                                         odds = ho.optDoubleOrNull("odds"),
                                         agf = ho.optIntOrNull("agf"),
                                         start = ho.optIntOrNull("start"),
-                                        videoUrl = ho.optString("videoUrl").takeIf { it.isNotBlank() }
+                                        videoUrl = ho.optString("videoUrl").takeIf { it.isNotBlank() },
+                                        detailUrl = ho.optString("detailUrl").takeIf { it.isNotBlank() }
                                     ))
                                 }
                             }
@@ -260,7 +268,7 @@ object MeetingCache {
                             h.weight?.let { put("weight", it) }; put("jockey", h.jockey)
                             h.hp?.let { put("hp", it) }; put("last6", h.last6); put("best", h.best)
                             h.odds?.let { put("odds", it) }; h.agf?.let { put("agf", it) }
-                            h.start?.let { put("start", it) }; put("videoUrl", h.videoUrl ?: "")
+                            h.start?.let { put("start", it) }; put("videoUrl", h.videoUrl ?: ""); put("detailUrl", h.detailUrl ?: "")
                         })
                     }
                     races.put(JSONObject().apply {
@@ -882,7 +890,14 @@ object TjkRepository {
             val no = cell(iNo).trim().filter { it.isDigit() }.toIntOrNull() ?: return@mapNotNull null
 
             val nameCell = cellEl(iName) ?: return@mapNotNull null
-            val linkedName = nameCell.select("a").firstOrNull()?.ownText()?.trim().orEmpty()
+            val nameLink = nameCell.select("a[href]").firstOrNull()
+            val detailUrl = nameLink?.let { a ->
+                a.attr("abs:href").ifBlank {
+                    val href = a.attr("href")
+                    if (href.startsWith("http", true)) href else BASE + if (href.startsWith('/')) href else "/$href"
+                }
+            }
+            val linkedName = nameLink?.ownText()?.trim().orEmpty()
             val rawName = if (linkedName.isNotBlank()) linkedName else nameCell.ownText().trim()
             val name = rawName
                 .replace(Regex("\\s+"), " ")
@@ -916,7 +931,8 @@ object TjkRepository {
                 odds = numericDouble(cell(iOdds)),
                 agf = agf,
                 start = firstInt(cell(iStart)),
-                videoUrl = directVideo
+                videoUrl = directVideo,
+                detailUrl = detailUrl
             )
         }.distinctBy { it.no }
     }
@@ -941,7 +957,9 @@ object Predictor {
         if (race.horses.isEmpty()) return emptyList()
         val maxHp = race.horses.mapNotNull { it.hp }.maxOrNull()?.coerceAtLeast(1) ?: 1
         val minWeight = race.horses.mapNotNull { it.weight }.minOrNull() ?: 0.0
+        val maxWeight = race.horses.mapNotNull { it.weight }.maxOrNull() ?: minWeight
         val minOdds = race.horses.mapNotNull { it.odds }.minOrNull()?.coerceAtLeast(.1) ?: 1.0
+        val maxAgf = race.horses.mapNotNull { it.agf }.maxOrNull()?.coerceAtLeast(1) ?: 1
 
         fun rankOf(horse: Horse, selector: (Horse) -> Double?): Int? {
             val value = selector(horse) ?: return null
@@ -973,28 +991,36 @@ object Predictor {
             }
         }
 
+        val maxFormScore = race.horses.maxOfOrNull { formScore(it.last6) }?.coerceAtLeast(1.0) ?: 1.0
+
         val raw = race.horses.map { h ->
-            var score = 34.0
+            var weighted = 0.0
+            var availableWeight = 0.0
             val reasons = mutableListOf<String>()
+            fun addComponent(value: Double, weight: Double) {
+                weighted += value.coerceIn(0.0, 1.0) * weight
+                availableWeight += weight
+            }
+
             h.agf?.let {
-                score += it * .55
+                addComponent(it.toDouble() / maxAgf, 28.0)
                 if (it >= 18) reasons += "AGF desteği yüksek"
             }
             h.hp?.let {
-                score += (it.toDouble() / maxHp) * 14
+                addComponent(it.toDouble() / maxHp, 15.0)
                 if (it >= maxHp - 5) reasons += "HP gruba göre güçlü"
             }
             h.weight?.let { w ->
-                val advantage = max(0.0, 5.0 - (w - minWeight))
-                score += advantage * 1.0
+                val weightValue = if (maxWeight <= minWeight) .5 else (maxWeight - w) / (maxWeight - minWeight)
+                addComponent(weightValue, 5.0)
                 if (w <= minWeight + 1.0) reasons += "kilo avantajı"
             }
             h.odds?.let { o ->
-                score += min(11.0, (minOdds / o) * 11)
+                addComponent((minOdds / o).coerceAtMost(1.0), 10.0)
                 if (o <= minOdds * 1.6) reasons += "piyasa desteği"
             }
             val fScore = formScore(h.last6)
-            score += min(13.0, fScore * .7)
+            if (h.last6.isNotBlank()) addComponent(fScore / maxFormScore, 20.0)
             if (formLabel(h.last6).contains("Yükseliyor") || formLabel(h.last6).contains("Formda")) reasons += "yakın formu olumlu"
             if (h.best.isNotBlank()) reasons += "pist/mesafe derecesi var"
 
@@ -1004,16 +1030,18 @@ object Predictor {
                 val strongRatio = ex.strongSupport.toDouble() / ex.totalSources
                 val surpriseRatio = ex.surpriseSupport.toDouble() / ex.totalSources
                 val negativeRatio = ex.negativeSupport.toDouble() / ex.totalSources
-                score += ratio * 12
-                score += strongRatio * 5
-                score += surpriseRatio * 2
-                score -= negativeRatio * 8
-                score += ex.sahaScore.coerceIn(-4, 6) * .7
+                val expertValue = (ratio * .62 + strongRatio * .28 + surpriseRatio * .08 - negativeRatio * .38).coerceIn(0.0, 1.0)
+                addComponent(expertValue, 17.0)
+                if (ex.sahaNotes.isNotEmpty()) {
+                    val sahaValue = ((ex.sahaScore.coerceIn(-4, 6) + 4).toDouble() / 10.0)
+                    addComponent(sahaValue, 5.0)
+                }
                 if (ex.support > 0) reasons += "uzman desteği ${ex.support}/${ex.totalSources}"
                 if (ex.strongSupport > 0) reasons += "${ex.strongSupport} güçlü uzman sinyali"
                 if (ex.negativeSupport > 0) reasons += "${ex.negativeSupport} olumsuz uzman görüşü"
                 if (ex.sahaNotes.isNotEmpty()) reasons += ex.sahaNotes.first()
             }
+            val score = if (availableWeight > 0.0) (weighted / availableWeight) * 100.0 else 50.0
             h to (score to reasons)
         }
 
@@ -1022,8 +1050,7 @@ object Predictor {
         val sorted = raw.sortedByDescending { it.second.first }
         return sorted.mapIndexed { index, item ->
             val h = item.first
-            val normalized = if (maxRaw == minRaw) 70 else
-                (50 + ((item.second.first - minRaw) / (maxRaw - minRaw)) * 46).toInt().coerceIn(45, 96)
+            val normalized = item.second.first.toInt().coerceIn(35, 96)
             val agf = h.agf ?: 0
             val hp = h.hp
             val weight = h.weight
@@ -1540,7 +1567,7 @@ fun RaceDetail(race: Race, expert: RaceExpertSignal?, onBack: () -> Unit) {
         }
         item {
             Text(
-                "Güven puanı; TJK verileri (AGF, HP, kilo, ganyan, form, pist/mesafe) ile erişilebilen bağımsız uzman kaynaklarının desteğini birlikte değerlendirir. Uzman siteleri yanıt vermezse uygulama onları beklemeden TJK verisiyle çalışmaya devam eder. Tahmin garanti değildir.",
+                "Güven puanı; AGF %28, HP %15, form %20, uzman %17, ganyan/piyasa %10, kilo %5 ve saha %5 ağırlıklarıyla hesaplanır. Eksik veri varsa o bileşen atı otomatik cezalandırmaz; mevcut bileşenlerin ağırlığı yeniden dengelenir. Uzman siteleri yanıt vermezse uygulama onları beklemeden TJK verisiyle çalışmaya devam eder. Tahmin garanti değildir.",
                 color = Muted,
                 fontSize = 11.sp
             )
@@ -1663,7 +1690,8 @@ private fun HorseCard(p: Pick) {
     }
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
-    var videoExpanded by remember(p.horse.no, p.horse.videoUrl) { mutableStateOf(false) }
+    val videoSource = p.horse.videoUrl ?: p.horse.detailUrl
+    var videoExpanded by remember(p.horse.no, videoSource) { mutableStateOf(false) }
     var videoLoading by remember(p.horse.no) { mutableStateOf(false) }
     var videos by remember(p.horse.no) { mutableStateOf<List<RaceVideo>>(emptyList()) }
 
@@ -1717,7 +1745,7 @@ private fun HorseCard(p: Pick) {
                     Text(p.reasons.joinToString(" · "), color = Muted, fontSize = 11.sp, lineHeight = 16.sp)
                 }
 
-                p.horse.videoUrl?.let { videoUrl ->
+                videoSource?.let { videoUrl ->
                     Spacer(Modifier.height(10.dp))
                     OutlinedButton(
                         onClick = {
