@@ -1,12 +1,14 @@
-# Two Horse 4.6 PRO
+# Two Horse 5.0 FINAL
 
-- Balanced transparent confidence scoring (AGF 28, HP 15, form 20, expert 17, odds 10, weight 5, saha 5)
-- Missing metrics are reweighted instead of treated as zero
-- TJK horse detail fallback for last 3 race videos
-- Recentered two-horse logo without embedded text
+Final consolidated build.
 
-
-## 4.9 PRO
-- Uzman desteği ayrıştırıldı: Destek, Güçlü ve ⭐ Favori/Banko ayrı sayaçlar.
-- Favori/Banko/tek sinyali güçlü desteğin alt kümesi olarak ayrıca bonuslanır; aynı site iki tam oy sayılmaz.
-- History JSON yeni alanla geriye uyumlu.
+- Cache-first race program and cache-first expert signals; live refresh runs in background.
+- Expert source resilience: longer network timeouts, OkHttp connection retry, two HTTP attempts, alternate user agents, redirects, multi-URL candidates, link discovery and same-day cache fallback.
+- Source diagnostics distinguish reachable sites from sites whose current race section could not be validated.
+- Seven expert sources remain configured: HorseTurk, Banko Tahminler, Yıldızlı Bülten, Liderform, Yarış Dergisi, Ganyan Canavarı, Puanlı Altılı Bülten.
+- Safer race-section matching scores multiple candidate sections instead of blindly taking the first matching race number.
+- Expert display separates Support, Strong, ⭐ Favorite/Banko, Surprise and Negative signals.
+- Confidence weights: AGF 30, Expert 25, Form 15, HP 10, Market 10, Weight 5, Saha 5. Missing metrics are reweighted, not zeroed.
+- Responsive layout, system back navigation, daily immutable pre-race history, finished-race hiding and countdown timers preserved.
+- TJK last-three-video links remain date-sorted and non-runner entries are excluded.
+- Two Horse logo alignment adjusted.

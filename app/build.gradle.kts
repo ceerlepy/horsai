@@ -12,8 +12,8 @@ android {
         applicationId = "com.yarisradar.app"
         minSdk = 26
         targetSdk = 35
-        versionCode = 43
-        versionName = "4.3.0"
+        versionCode = 50
+        versionName = "5.0.0"
     }
 
     compileOptions {

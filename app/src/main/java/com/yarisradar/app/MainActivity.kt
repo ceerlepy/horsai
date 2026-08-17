@@ -125,11 +125,17 @@ data class ExpertHorseSignal(
 )
 
 data class RaceExpertSignal(
+    // sourceCount = bu koşu için gerçekten parse edilebilen kaynak sayısı.
+    // reachableSourceCount = sayfasına erişilebilen kaynak sayısı; UI bunu "aktif" diye gösterir.
     val sourceCount: Int = 0,
     val configuredSourceCount: Int = 0,
+    val reachableSourceCount: Int = 0,
     val freshSourceCount: Int = 0,
     val cachedSourceCount: Int = 0,
     val activeSources: List<String> = emptyList(),
+    val reachableSources: List<String> = emptyList(),
+    val unreachableSources: List<String> = emptyList(),
+    val unusableSources: List<String> = emptyList(),
     val byHorse: Map<Int, ExpertHorseSignal> = emptyMap()
 )
 
@@ -163,8 +169,8 @@ object VideoRepository {
         okhttp3.OkHttpClient.Builder()
             .connectTimeout(4, java.util.concurrent.TimeUnit.SECONDS)
             .readTimeout(6, java.util.concurrent.TimeUnit.SECONDS)
-            .callTimeout(8, java.util.concurrent.TimeUnit.SECONDS)
-            .retryOnConnectionFailure(false)
+            .callTimeout(12, java.util.concurrent.TimeUnit.SECONDS)
+            .retryOnConnectionFailure(true)
             .build()
     }
 
@@ -210,8 +216,19 @@ object VideoRepository {
 
             val archiveDoc = if (archiveUrl == startUrl) firstDoc else fetch(archiveUrl) ?: return@withTimeoutOrNull emptyList()
             val currentKosu = Regex("[?&]KosuKodu=([^&]+)").find(archiveUrl)?.groupValues?.getOrNull(1)
+            fun videoDate(v: RaceVideo): Long {
+                val raw = Regex("\\b(\\d{2})[./](\\d{2})[./](\\d{4})\\b").find(v.label) ?: return 0L
+                val (dd, mm, yyyy) = raw.destructured
+                return runCatching {
+                    java.util.GregorianCalendar(yyyy.toInt(), mm.toInt() - 1, dd.toInt()).timeInMillis
+                }.getOrDefault(0L)
+            }
+
             archiveLinks(archiveDoc)
+                // TJK bazı geçmiş satırlarında "Koşmaz" kaydı da video bağlantısı üretebiliyor; gerçek yarış saymıyoruz.
+                .filterNot { it.label.contains("Koşmaz", ignoreCase = true) }
                 .filterNot { v -> currentKosu != null && v.url.contains("KosuKodu=$currentKosu") }
+                .sortedByDescending(::videoDate)
                 .take(3)
         } ?: emptyList()
     }
@@ -388,10 +405,13 @@ object ExpertRepository {
     private val months = listOf("ocak", "subat", "mart", "nisan", "mayis", "haziran", "temmuz", "agustos", "eylul", "ekim", "kasim", "aralik")
     private val client by lazy {
         okhttp3.OkHttpClient.Builder()
-            .connectTimeout(2500, java.util.concurrent.TimeUnit.MILLISECONDS)
-            .readTimeout(3500, java.util.concurrent.TimeUnit.MILLISECONDS)
-            .callTimeout(4500, java.util.concurrent.TimeUnit.MILLISECONDS)
-            .retryOnConnectionFailure(false)
+            .connectTimeout(5, java.util.concurrent.TimeUnit.SECONDS)
+            .readTimeout(8, java.util.concurrent.TimeUnit.SECONDS)
+            .writeTimeout(8, java.util.concurrent.TimeUnit.SECONDS)
+            .callTimeout(12, java.util.concurrent.TimeUnit.SECONDS)
+            .retryOnConnectionFailure(true)
+            .followRedirects(true)
+            .followSslRedirects(true)
             .build()
     }
 
@@ -412,6 +432,7 @@ object ExpertRepository {
             candidates = { city, date ->
                 val (d, m, y) = dateParts(date)
                 listOf(
+                    "https://www.bankotahminler.com/bulten/",
                     "https://www.bankotahminler.com/ai-tahmin/$d-${months[m-1]}-$y-${slug(city)}/",
                     "https://www.bankotahminler.com/ai-tahmin/$d-${months[m-1]}-$y/"
                 )
@@ -419,16 +440,16 @@ object ExpertRepository {
             discoveryPages = { _, _ -> listOf("https://www.bankotahminler.com/ai-tahmin/") }
         ),
         Source(
-            name = "Yabancı Ganyan",
-            strongOnly = true,
+            name = "Yıldızlı Bülten",
             candidates = { city, date ->
                 val (d, m, y) = dateParts(date)
+                val iso = "$y-${m.toString().padStart(2,'0')}-${d.toString().padStart(2,'0')}"
                 listOf(
-                    "https://www.yabanciganyan.com/gunluk-analiz/${slug(city)}-at-yarisi-tahminleri-$d-${months[m-1]}-$y/",
-                    "https://www.yabanciganyan.com/hipodrom/${slug(city)}/program/${date.replace('/', '-')}/"
+                    "https://www.ybulten.com.tr/bulten/$iso/${urlEncode(city)}",
+                    "https://www.ybulten.com.tr/?s=${urlEncode("$city $d ${months[m-1]} $y")}"
                 )
             },
-            discoveryPages = { _, _ -> listOf("https://www.yabanciganyan.com/gunluk-analiz/") }
+            discoveryPages = { _, _ -> listOf("https://www.ybulten.com.tr/") }
         ),
         Source(
             name = "Liderform",
@@ -469,13 +490,24 @@ object ExpertRepository {
             candidates = { city, date ->
                 val (d, m, y) = dateParts(date)
                 listOf(
+                    "https://www.puanlibulten.com/",
                     "https://puanlialtilibulten.blogspot.com/search?q=${urlEncode("$city $d ${months[m-1]} $y")}",
                     "https://puanlialtilibulten.blogspot.com/search?q=${urlEncode(city)}"
                 )
             },
-            discoveryPages = { _, _ -> listOf("https://puanlialtilibulten.blogspot.com/") }
+            discoveryPages = { _, _ -> listOf("https://www.puanlibulten.com/", "https://puanlialtilibulten.blogspot.com/") }
         )
     )
+
+    fun loadCachedOnly(context: Context, meetings: List<Meeting>): Map<String, RaceExpertSignal> {
+        if (meetings.isEmpty()) return emptyMap()
+        val cityDocs = meetings.distinctBy { it.city }.associate { meeting ->
+            meeting.city to sources.mapNotNull { source ->
+                loadCached(context, source.name, meeting.city, meeting.date)?.let { SourceDoc(source, it, false) }
+            }
+        }
+        return buildSignals(meetings, cityDocs)
+    }
 
     suspend fun load(context: Context, meetings: List<Meeting>): Map<String, RaceExpertSignal> = withContext(Dispatchers.IO) {
         if (meetings.isEmpty()) return@withContext emptyMap()
@@ -484,7 +516,7 @@ object ExpertRepository {
             val jobs = uniqueMeetings.flatMap { meeting ->
                 sources.map { source ->
                     async {
-                        val fresh = withTimeoutOrNull(6200) { fetchSource(source, meeting.city, meeting.date) }
+                        val fresh = withTimeoutOrNull(16000) { fetchSource(source, meeting.city, meeting.date) }
                         val cached = if (fresh == null) loadCached(context, source.name, meeting.city, meeting.date) else null
                         if (fresh != null) saveCached(context, source.name, meeting.city, meeting.date, fresh)
                         Triple(meeting.city, source, fresh?.let { SourceDoc(source, it, true) }
@@ -495,142 +527,178 @@ object ExpertRepository {
             val cityDocs = jobs.awaitAll()
                 .filter { it.third != null }
                 .groupBy({ it.first }, { it.third!! })
+            buildSignals(meetings, cityDocs)
+        }
+    }
 
-            buildMap {
-                meetings.forEach { meeting ->
-                    val docs = cityDocs[meeting.city].orEmpty()
-                    meeting.races.forEach { race ->
-                        val supports = mutableMapOf<Int, MutableList<String>>()
-                        val strongs = mutableMapOf<Int, MutableList<String>>()
-                        val favoriteBankos = mutableMapOf<Int, MutableList<String>>()
-                        val surprises = mutableMapOf<Int, MutableList<String>>()
-                        val negatives = mutableMapOf<Int, MutableList<String>>()
-                        val sahaScores = mutableMapOf<Int, Int>()
-                        val sahaNotes = mutableMapOf<Int, MutableList<String>>()
-                        val validNos = race.horses.map { it.no }.toSet()
-                        val validatedDocs = docs.mapNotNull { doc ->
-                            validatedRaceSection(doc.text, race, meeting.races.size)?.let { section -> doc to section }
-                        }
-                        supports.clear(); strongs.clear(); favoriteBankos.clear(); surprises.clear(); negatives.clear(); sahaScores.clear(); sahaNotes.clear()
-                        validatedDocs.forEach { (doc, raceText) ->
-                            race.horses.forEach { horse ->
-                                val signal = analyzeHorseText(raceText, horse, validNos)
-                                val positive = if (doc.source.strongOnly) signal.strong else signal.positive
-                                if (positive && !signal.negative) supports.getOrPut(horse.no) { mutableListOf() }.add(doc.source.name)
-                                if (signal.strong && !signal.negative) strongs.getOrPut(horse.no) { mutableListOf() }.add(doc.source.name)
-                                if (signal.favoriteBanko && !signal.negative) favoriteBankos.getOrPut(horse.no) { mutableListOf() }.add(doc.source.name)
-                                if (signal.surprise && !signal.negative) surprises.getOrPut(horse.no) { mutableListOf() }.add(doc.source.name)
-                                if (signal.negative) negatives.getOrPut(horse.no) { mutableListOf() }.add(doc.source.name)
-                                if (signal.sahaScore != 0) sahaScores[horse.no] = (sahaScores[horse.no] ?: 0) + signal.sahaScore
-                                if (signal.sahaNotes.isNotEmpty()) sahaNotes.getOrPut(horse.no) { mutableListOf() }.addAll(signal.sahaNotes)
-                            }
-                        }
-                        val freshCount = validatedDocs.count { it.first.fresh }
-                        val cachedCount = validatedDocs.size - freshCount
-                        put(raceKey(race), RaceExpertSignal(
-                            sourceCount = validatedDocs.size,
-                            configuredSourceCount = sources.size,
-                            freshSourceCount = freshCount,
-                            cachedSourceCount = cachedCount,
-                            activeSources = validatedDocs.map { it.first.source.name },
-                            byHorse = race.horses.associate { horse ->
-                                val src = supports[horse.no].orEmpty().distinct()
-                                horse.no to ExpertHorseSignal(
-                                    support = src.size,
-                                    totalSources = validatedDocs.size,
-                                    sources = src,
-                                    strongSupport = strongs[horse.no].orEmpty().distinct().size,
-                                    favoriteBankoSupport = favoriteBankos[horse.no].orEmpty().distinct().size,
-                                    surpriseSupport = surprises[horse.no].orEmpty().distinct().size,
-                                    negativeSupport = negatives[horse.no].orEmpty().distinct().size,
-                                    sahaScore = sahaScores[horse.no] ?: 0,
-                                    sahaNotes = sahaNotes[horse.no].orEmpty().distinct().take(4)
-                                )
-                            }
-                        ))
+    private fun buildSignals(meetings: List<Meeting>, cityDocs: Map<String, List<SourceDoc>>): Map<String, RaceExpertSignal> = buildMap {
+        meetings.forEach { meeting ->
+            val docs = cityDocs[meeting.city].orEmpty()
+            meeting.races.forEach { race ->
+                val supports = mutableMapOf<Int, MutableList<String>>()
+                val strongs = mutableMapOf<Int, MutableList<String>>()
+                val favoriteBankos = mutableMapOf<Int, MutableList<String>>()
+                val surprises = mutableMapOf<Int, MutableList<String>>()
+                val negatives = mutableMapOf<Int, MutableList<String>>()
+                val sahaScores = mutableMapOf<Int, Int>()
+                val sahaNotes = mutableMapOf<Int, MutableList<String>>()
+                val validNos = race.horses.map { it.no }.toSet()
+                val validatedDocs = docs.mapNotNull { doc ->
+                    validatedRaceSection(doc.text, race, meeting.races.size)?.let { section -> doc to section }
+                }.distinctBy { it.first.source.name }
+
+                validatedDocs.forEach { (doc, raceText) ->
+                    race.horses.forEach { horse ->
+                        val signal = analyzeHorseText(raceText, horse, validNos)
+                        val positive = if (doc.source.strongOnly) signal.strong else signal.positive
+                        if (positive && !signal.negative) supports.getOrPut(horse.no) { mutableListOf() }.add(doc.source.name)
+                        if (signal.strong && !signal.negative) strongs.getOrPut(horse.no) { mutableListOf() }.add(doc.source.name)
+                        if (signal.favoriteBanko && !signal.negative) favoriteBankos.getOrPut(horse.no) { mutableListOf() }.add(doc.source.name)
+                        if (signal.surprise && !signal.negative) surprises.getOrPut(horse.no) { mutableListOf() }.add(doc.source.name)
+                        if (signal.negative) negatives.getOrPut(horse.no) { mutableListOf() }.add(doc.source.name)
+                        if (signal.sahaScore != 0) sahaScores[horse.no] = (sahaScores[horse.no] ?: 0) + signal.sahaScore
+                        if (signal.sahaNotes.isNotEmpty()) sahaNotes.getOrPut(horse.no) { mutableListOf() }.addAll(signal.sahaNotes)
                     }
                 }
+                val reachableDocs = docs.distinctBy { it.source.name }
+                val reachableNames = reachableDocs.map { it.source.name }.distinct()
+                val activeNames = validatedDocs.map { it.first.source.name }.distinct()
+                val allNames = sources.map { it.name }
+                val freshCount = validatedDocs.count { it.first.fresh }
+                val cachedCount = validatedDocs.size - freshCount
+                put(raceKey(race), RaceExpertSignal(
+                    sourceCount = validatedDocs.size,
+                    configuredSourceCount = sources.size,
+                    reachableSourceCount = reachableDocs.size,
+                    freshSourceCount = freshCount,
+                    cachedSourceCount = cachedCount,
+                    activeSources = activeNames,
+                    reachableSources = reachableNames,
+                    unreachableSources = allNames.filterNot { it in reachableNames },
+                    unusableSources = reachableNames.filterNot { it in activeNames },
+                    byHorse = race.horses.associate { horse ->
+                        val src = supports[horse.no].orEmpty().distinct()
+                        horse.no to ExpertHorseSignal(
+                            support = src.size,
+                            totalSources = validatedDocs.size,
+                            sources = src,
+                            strongSupport = strongs[horse.no].orEmpty().distinct().size,
+                            favoriteBankoSupport = favoriteBankos[horse.no].orEmpty().distinct().size,
+                            surpriseSupport = surprises[horse.no].orEmpty().distinct().size,
+                            negativeSupport = negatives[horse.no].orEmpty().distinct().size,
+                            sahaScore = sahaScores[horse.no] ?: 0,
+                            sahaNotes = sahaNotes[horse.no].orEmpty().distinct()
+                        )
+                    }
+                ))
             }
         }
     }
 
     private fun fetchSource(source: Source, city: String, date: String): String? {
-        source.candidates(city, date).forEach { url ->
-            fetchDocument(url)?.let { doc ->
-                val text = normalizeExpert(doc.body().text())
-                if (looksRelevant(text, city, date)) return text
-                discoverMatchingLink(doc, city, date)?.let { discovered ->
+        val attempted = mutableSetOf<String>()
+        fun tryDoc(url: String): String? {
+            if (!attempted.add(url)) return null
+            val doc = fetchDocument(url) ?: return null
+            val text = normalizeExpert(doc.body().text())
+            if (looksRelevant(text, city, date)) return text
+            discoverMatchingLinks(doc, city, date).forEach { discovered ->
+                if (attempted.add(discovered)) {
                     fetchDocument(discovered)?.let { d2 ->
                         val t2 = normalizeExpert(d2.body().text())
                         if (looksRelevant(t2, city, date)) return t2
                     }
                 }
             }
+            return null
         }
-        source.discoveryPages(city, date).forEach { url ->
-            val doc = fetchDocument(url) ?: return@forEach
-            discoverMatchingLink(doc, city, date)?.let { discovered ->
-                fetchDocument(discovered)?.let { d2 ->
-                    val t2 = normalizeExpert(d2.body().text())
-                    if (looksRelevant(t2, city, date)) return t2
+        source.candidates(city, date).forEach { url -> tryDoc(url)?.let { return it } }
+        source.discoveryPages(city, date).forEach { url -> tryDoc(url)?.let { return it } }
+        return null
+    }
+
+    private fun fetchDocument(url: String): Document? {
+        val userAgents = listOf(
+            "Mozilla/5.0 (Linux; Android 15; Mobile) AppleWebKit/537.36 Chrome/140 Mobile Safari/537.36",
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/140 Safari/537.36"
+        )
+        repeat(2) { attempt ->
+            val doc = runCatching {
+                val req = okhttp3.Request.Builder().url(url)
+                    .header("User-Agent", userAgents[attempt.coerceAtMost(userAgents.lastIndex)])
+                    .header("Accept-Language", "tr-TR,tr;q=0.9,en;q=0.6")
+                    .header("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+                    .header("Cache-Control", "no-cache")
+                    .build()
+                client.newCall(req).execute().use { r ->
+                    if (!r.isSuccessful) {
+                        if (r.code == 408 || r.code == 429 || r.code >= 500) Thread.sleep(250L * (attempt + 1))
+                        null
+                    } else {
+                        val html = r.body?.string().orEmpty()
+                        if (html.length < 250) null else Jsoup.parse(html, r.request.url.toString())
+                    }
                 }
-            }
+            }.getOrNull()
+            if (doc != null) return doc
         }
         return null
     }
 
-    private fun fetchDocument(url: String): Document? = runCatching {
-        val req = okhttp3.Request.Builder().url(url)
-            .header("User-Agent", "Mozilla/5.0 (Linux; Android 15; Mobile) AppleWebKit/537.36 Chrome/140 Mobile Safari/537.36")
-            .header("Accept-Language", "tr-TR,tr;q=0.9")
-            .build()
-        client.newCall(req).execute().use { r ->
-            if (!r.isSuccessful) null else {
-                val html = r.body?.string().orEmpty()
-                if (html.length < 250) null else Jsoup.parse(html, r.request.url.toString())
-            }
-        }
-    }.getOrNull()
-
-    private fun discoverMatchingLink(doc: Document, city: String, date: String): String? {
+    private fun discoverMatchingLinks(doc: Document, city: String, date: String): List<String> {
         val cityN = normalize(city)
         val (d, m, y) = dateParts(date)
         val month = months[m-1]
         return doc.select("a[href]").mapNotNull { a ->
             val text = normalizeExpert(a.text() + " " + a.attr("href"))
             val cityScore = if (text.contains(cityN)) 4 else 0
-            val dayScore = if (Regex("(^| )0?$d([ /-]|${'$'})").containsMatchIn(text)) 2 else 0
+            val dayScore = if (Regex("(^|[^0-9])0?$d([^0-9]|${'$'})").containsMatchIn(text)) 2 else 0
             val monthScore = if (text.contains(month) || text.contains(m.toString().padStart(2,'0'))) 2 else 0
             val yearScore = if (text.contains(y.toString())) 1 else 0
-            val topicScore = if (listOf("tahmin", "analiz", "kosu", "yaris", "bulten").any { text.contains(it) }) 2 else 0
+            val topicScore = if (listOf("tahmin", "analiz", "kosu", "yaris", "bulten", "dikkat").any { text.contains(it) }) 2 else 0
             val score = cityScore + dayScore + monthScore + yearScore + topicScore
             val href = a.attr("abs:href").ifBlank { a.attr("href") }
             if (score >= 6 && href.startsWith("http")) score to href else null
-        }.maxByOrNull { it.first }?.second
+        }.sortedByDescending { it.first }.map { it.second }.distinct().take(4)
     }
 
     private fun looksRelevant(text: String, city: String, date: String): Boolean {
         if (text.length < 180) return false
         val cityN = normalize(city)
         val (d, m, y) = dateParts(date)
+        val dd = d.toString().padStart(2, '0')
+        val mm = m.toString().padStart(2, '0')
+        val exactDate = listOf(
+            "$d ${months[m-1]} $y", "$dd ${months[m-1]} $y",
+            "$dd.$mm.$y", "$d.$m.$y", "$dd/$mm/$y", "$d/$m/$y",
+            "$dd-$mm-$y", "$y-$mm-$dd"
+        ).any { text.contains(it) }
         val hasCity = text.contains(cityN)
-        val dateSignals = listOf(d.toString(), months[m-1], y.toString()).count { text.contains(it) }
-        val hasRaceLanguage = listOf("kosu", "tahmin", "favori", "rakip", "surpriz", "banko", "agf").any { text.contains(it) }
-        return hasCity && dateSignals >= 1 && hasRaceLanguage
+        val hasDay = Regex("(^|[^0-9])0?$d([^0-9]|${'$'})").containsMatchIn(text)
+        val hasMonth = text.contains(months[m-1]) || text.contains(mm)
+        val hasYear = text.contains(y.toString())
+        val hasRaceLanguage = listOf("kosu", "tahmin", "favori", "rakip", "surpriz", "banko", "agf", "ayak").any { text.contains(it) }
+        return hasCity && hasRaceLanguage && (exactDate || (hasDay && hasMonth && hasYear))
     }
 
     private fun validatedRaceSection(text: String, race: Race, totalRaces: Int): String? {
         val raceNo = race.number
         val explicitPatterns = listOf("$raceNo kosu", "$raceNo. kosu", "${raceNo}kosu", "${raceNo} kosu olan")
-        val explicitStarts = explicitPatterns.map { text.indexOf(it) }.filter { it >= 0 }
+        val explicitStarts = explicitPatterns.flatMap { pattern ->
+            buildList {
+                var pos = text.indexOf(pattern)
+                while (pos >= 0) { add(pos); pos = text.indexOf(pattern, pos + pattern.length) }
+            }
+        }.distinct()
         if (explicitStarts.isNotEmpty()) {
-            val start = explicitStarts.minOrNull() ?: 0
             val next = raceNo + 1
-            val ends = listOf("$next kosu", "$next. kosu", "${next}kosu")
-                .map { text.indexOf(it, start + 4) }.filter { it > start }
-            val end = ends.minOrNull() ?: min(text.length, start + 4200)
-            val section = text.substring(start, end)
-            if (sectionHasRaceSignal(section, race)) return section
+            val candidates = explicitStarts.map { start ->
+                val ends = listOf("$next kosu", "$next. kosu", "${next}kosu")
+                    .map { text.indexOf(it, start + 4) }.filter { it > start }
+                val end = ends.minOrNull() ?: min(text.length, start + 4200)
+                text.substring(start, end)
+            }.filter { sectionHasRaceSignal(it, race) }
+            candidates.maxByOrNull { sectionQuality(it, race) }?.let { return it }
         }
 
         // Bazı tahmin siteleri koşu numarası yerine 1.AYAK/2.AYAK kullanıyor.
@@ -663,14 +731,21 @@ object ExpertRepository {
         return null
     }
 
+    private fun sectionQuality(section: String, race: Race): Int {
+        val horseNames = race.horses.count { h -> normalize(h.name).length >= 4 && section.contains(normalize(h.name)) }
+        val validNos = race.horses.map { it.no }.toSet()
+        val nums = Regex("\b\d{1,2}\b").findAll(section).mapNotNull { it.value.toIntOrNull() }.filter { it in validNos }.toSet().size
+        val tipCount = listOf("favori", "banko", "tek", "rakip", "surpriz", "plase", "tahmin", "ayak").count { section.contains(it) }
+        return horseNames * 8 + nums * 2 + tipCount
+    }
+
     private fun sectionHasRaceSignal(section: String, race: Race): Boolean {
         val horseNames = race.horses.count { h -> normalize(h.name).length >= 4 && section.contains(normalize(h.name)) }
-        if (horseNames >= 1) return true
         val validNos = race.horses.map { it.no }.toSet()
-        val nums = Regex("\\b\\d{1,2}\\b").findAll(section).mapNotNull { it.value.toIntOrNull() }
+        val nums = Regex("\b\d{1,2}\b").findAll(section).mapNotNull { it.value.toIntOrNull() }
             .filter { it in validNos }.toSet()
         val hasTipLanguage = listOf("ayak", "favori", "banko", "tek", "rakip", "surpriz", "plase", "tahmin").any { section.contains(it) }
-        return hasTipLanguage && nums.isNotEmpty()
+        return horseNames >= 1 || (hasTipLanguage && nums.size >= 2)
     }
 
     private data class ParsedHorseText(
@@ -958,7 +1033,7 @@ object TjkRepository {
             .find(bodyText)?.groupValues?.getOrNull(1)?.trim().orEmpty().take(220)
 
         val h3s = doc.select("h3").map { it.text().replace(Regex("\\s+"), " ").trim() }
-        val raceHeads = h3s.mapIndexedNotNull { idx, text ->
+        val raceHeads: List<Triple<Int, String, String>> = h3s.mapIndexedNotNull { idx, text ->
             val m = Regex("^(\\d+)\\.\\s*Koşu\\s+(\\d{1,2}[.:]\\d{2})", RegexOption.IGNORE_CASE).find(text)
                 ?: return@mapIndexedNotNull null
             val title = h3s.drop(idx + 1).firstOrNull { candidate ->
@@ -1265,8 +1340,9 @@ fun TwoHorseApp() {
     ) {
         val context = LocalContext.current.applicationContext
         val initialCache = remember { MeetingCache.load(context) }
+        val initialExperts = remember(initialCache) { ExpertRepository.loadCachedOnly(context, initialCache) }
         var meetings by remember { mutableStateOf(initialCache) }
-        var expertSignals by remember { mutableStateOf<Map<String, RaceExpertSignal>>(emptyMap()) }
+        var expertSignals by remember { mutableStateOf(initialExperts) }
         var loading by remember { mutableStateOf(initialCache.isEmpty()) }
         var refreshing by remember { mutableStateOf(false) }
         var error by remember { mutableStateOf<String?>(null) }
@@ -1513,7 +1589,7 @@ private fun TopHeader(onRefresh: () -> Unit, refreshing: Boolean, onHistory: () 
             Image(
                 painter = painterResource(id = R.drawable.two_horse_logo),
                 contentDescription = "Two Horse",
-                modifier = Modifier.size(if (compact) 46.dp else 52.dp).clip(RoundedCornerShape(16.dp))
+                modifier = Modifier.offset(x = 4.dp).size(if (compact) 46.dp else 52.dp).clip(RoundedCornerShape(16.dp))
             )
             Spacer(Modifier.width(12.dp))
             Column(Modifier.weight(1f)) {
@@ -1761,29 +1837,42 @@ fun RaceDetail(race: Race, expert: RaceExpertSignal?, onBack: () -> Unit) {
 @Composable
 private fun ExpertStatusCard(expert: RaceExpertSignal?) {
     val configured = expert?.configuredSourceCount ?: 7
+    val reachable = expert?.reachableSourceCount ?: 0
+    val usable = expert?.sourceCount ?: 0
     val fresh = expert?.freshSourceCount ?: 0
     val cached = expert?.cachedSourceCount ?: 0
-    val available = expert?.sourceCount ?: 0
     Card(
         colors = CardDefaults.cardColors(containerColor = Surface),
         shape = RoundedCornerShape(16.dp),
         border = CardDefaults.outlinedCardBorder()
     ) {
         Column(Modifier.fillMaxWidth().padding(13.dp)) {
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Text("Uzman verisi", fontWeight = FontWeight.Black, fontSize = 12.sp, color = Ink, modifier = Modifier.weight(1f))
-                Text("$available/$configured site aktif", color = if (available > 0) Green else Muted, fontWeight = FontWeight.Bold, fontSize = 11.sp)
-            }
-            if (available > 0) {
+            // Küçük telefonlarda sağdaki durum metni başlığı ezmesin: iki bağımsız satır.
+            Text("Uzman verisi", fontWeight = FontWeight.Black, fontSize = 12.sp, color = Ink)
+            Spacer(Modifier.height(3.dp))
+            Text(
+                "$reachable/$configured siteye ulaşıldı · $usable/$configured bu koşuda yorum bulundu",
+                color = if (usable > 0) Green else Muted, fontWeight = FontWeight.Bold, fontSize = 10.sp,
+                maxLines = 2, overflow = TextOverflow.Ellipsis
+            )
+            if (reachable > 0) {
                 Spacer(Modifier.height(4.dp))
                 Text(
                     buildString {
-                        append("$fresh canlı")
+                        append("Yorum verisi: $fresh canlı")
                         if (cached > 0) append(" · $cached önbellekten")
-                        expert?.activeSources?.takeIf { it.isNotEmpty() }?.let { append(" · "); append(it.joinToString(", ")) }
+                        expert?.reachableSources?.takeIf { it.isNotEmpty() }?.let { append(" · Erişilen: "); append(it.joinToString(", ")) }
                     },
-                    color = Muted, fontSize = 9.sp, maxLines = 2, overflow = TextOverflow.Ellipsis
+                    color = Muted, fontSize = 9.sp, maxLines = 3, overflow = TextOverflow.Ellipsis
                 )
+                expert?.unreachableSources?.takeIf { it.isNotEmpty() }?.let { names ->
+                    Spacer(Modifier.height(2.dp))
+                    Text("Ulaşılamayan: ${names.joinToString(", ")}", color = Muted, fontSize = 8.sp, maxLines = 2, overflow = TextOverflow.Ellipsis)
+                }
+                expert?.unusableSources?.takeIf { it.isNotEmpty() }?.let { names ->
+                    Spacer(Modifier.height(2.dp))
+                    Text("Site açıldı, bu koşunun yorumu doğrulanamadı: ${names.joinToString(", ")}", color = Muted, fontSize = 8.sp, maxLines = 2, overflow = TextOverflow.Ellipsis)
+                }
             } else {
                 Spacer(Modifier.height(4.dp))
                 Text("Uzman siteleri yanıt vermese bile TJK verisiyle analiz devam eder.", color = Muted, fontSize = 9.sp)
