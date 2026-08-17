@@ -48,6 +48,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.coroutines.supervisorScope
+import kotlinx.coroutines.channels.Channel
 import org.jsoup.Jsoup
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
@@ -406,10 +407,10 @@ object ExpertRepository {
     private val months = listOf("ocak", "subat", "mart", "nisan", "mayis", "haziran", "temmuz", "agustos", "eylul", "ekim", "kasim", "aralik")
     private val client by lazy {
         okhttp3.OkHttpClient.Builder()
-            .connectTimeout(5, java.util.concurrent.TimeUnit.SECONDS)
-            .readTimeout(8, java.util.concurrent.TimeUnit.SECONDS)
-            .writeTimeout(8, java.util.concurrent.TimeUnit.SECONDS)
-            .callTimeout(12, java.util.concurrent.TimeUnit.SECONDS)
+            .connectTimeout(10, java.util.concurrent.TimeUnit.SECONDS)
+            .readTimeout(25, java.util.concurrent.TimeUnit.SECONDS)
+            .writeTimeout(10, java.util.concurrent.TimeUnit.SECONDS)
+            .callTimeout(30, java.util.concurrent.TimeUnit.SECONDS)
             .retryOnConnectionFailure(true)
             .followRedirects(true)
             .followSslRedirects(true)
@@ -528,35 +529,66 @@ object ExpertRepository {
         if (initial.isNotEmpty()) withContext(Dispatchers.Main) { onUpdate(initial) }
 
         supervisorScope {
-            val jobs = meetings.distinctBy { it.city }.flatMap { meeting ->
+            // Tüm kaynaklar gerçekten paralel çalışır. Global 15 sn kesme yok: yavaş bir kaynağın
+            // güvenilir verisini sırf diğerlerinden geç geldi diye kaybetmeyiz. Her HTTP isteğinin
+            // kendi timeout/retry sınırı fetchSource/client içinde kalır.
+            val resultChannel = Channel<Triple<String, Source, SourceDoc?>>(Channel.UNLIMITED)
+            val tasks = meetings.distinctBy { it.city }.flatMap { meeting ->
                 sources.map { source ->
-                    async {
-                        // Kaynağın tüm URL/discovery zincirinin toplam süresi sınırlandırılır.
-                        val fresh = withTimeoutOrNull(15000) { fetchSource(source, meeting.city, meeting.date) }
+                    launch(Dispatchers.IO) {
+                        val fresh = withTimeoutOrNull(30_000L) {
+                            // Kaynak başına kesin üst sınır. fetchSource birden fazla URL keşfetse bile
+                            // tek uzman sitesi toplamda 30 saniyeden uzun tutulmaz.
+                            kotlinx.coroutines.runInterruptible {
+                                fetchSource(source, meeting.city, meeting.date)
+                            }
+                        }
                         val cached = if (fresh == null) loadCached(context, source.name, meeting.city, meeting.date) else null
                         if (fresh != null) saveCached(context, source.name, meeting.city, meeting.date, fresh)
-                        Triple(meeting.city, source, fresh?.let { SourceDoc(source, it, true) }
-                            ?: cached?.let { SourceDoc(source, it, false) })
+                        resultChannel.send(
+                            Triple(
+                                meeting.city,
+                                source,
+                                fresh?.let { SourceDoc(source, it, true) }
+                                    ?: cached?.let { SourceDoc(source, it, false) }
+                            )
+                        )
                     }
                 }
             }
 
-            // Her kaynak tamamlandığı anda state/model güncellenir; tüm 7 kaynağı beklemiyoruz.
-            jobs.forEach { job ->
-                launch {
-                    val (city, source, doc) = job.await()
-                    if (doc != null) {
-                        val snapshot = synchronized(docsByCity) {
+            var remaining = tasks.size
+            while (remaining > 0) {
+                // İlk tamamlanan kaynağı al, ardından çok yakın zamanda gelen sonuçları tek UI
+                // güncellemesinde birleştir. Böylece scroll sırasında 7 ayrı ağır recomposition yok.
+                val batch = mutableListOf(resultChannel.receive())
+                remaining--
+                delay(300)
+                while (true) {
+                    val next = resultChannel.tryReceive().getOrNull() ?: break
+                    batch += next
+                    remaining--
+                }
+
+                var changed = false
+                synchronized(docsByCity) {
+                    batch.forEach { (city, source, doc) ->
+                        if (doc != null) {
                             val list = docsByCity.getOrPut(city) { mutableListOf() }
                             list.removeAll { it.source.name == source.name }
                             list.add(doc)
-                            docsByCity.mapValues { (_, v) -> v.toList() }
+                            changed = true
                         }
-                        val signals = buildSignals(meetings, snapshot)
-                        withContext(Dispatchers.Main) { onUpdate(signals) }
                     }
                 }
+                if (changed) {
+                    val snapshot = synchronized(docsByCity) { docsByCity.mapValues { (_, v) -> v.toList() } }
+                    // HTML expert aggregation/model input preparation stays off the Main thread.
+                    val signals = withContext(Dispatchers.Default) { buildSignals(meetings, snapshot) }
+                    withContext(Dispatchers.Main.immediate) { onUpdate(signals) }
+                }
             }
+            resultChannel.close()
         }
 
         buildSignals(meetings, synchronized(docsByCity) { docsByCity.mapValues { it.value.toList() } })
@@ -1371,9 +1403,10 @@ fun TwoHorseApp() {
     ) {
         val context = LocalContext.current.applicationContext
         val initialCache = remember { MeetingCache.load(context) }
-        val initialExperts = remember(initialCache) { ExpertRepository.loadCachedOnly(context, initialCache) }
+        // Program cache'i anında ekrana gelir. Uzman cache'inin parse/aggregation işi daha ağır
+        // olabildiği için Main thread'i bloke etmeden hemen arka planda yüklenir.
         var meetings by remember { mutableStateOf(initialCache) }
-        var expertSignals by remember { mutableStateOf(initialExperts) }
+        var expertSignals by remember { mutableStateOf<Map<String, RaceExpertSignal>>(emptyMap()) }
         var loading by remember { mutableStateOf(initialCache.isEmpty()) }
         var refreshing by remember { mutableStateOf(false) }
         var error by remember { mutableStateOf<String?>(null) }
@@ -1404,16 +1437,19 @@ fun TwoHorseApp() {
         LaunchedEffect(meetings) {
             if (meetings.isNotEmpty()) {
                 // Yeni TJK programı geldiyse bile önce aynı günün uzman cache'ini anında göster.
-                val cachedExperts = ExpertRepository.loadCachedOnly(context, meetings)
+                val cachedExperts = withContext(Dispatchers.Default) {
+                    ExpertRepository.loadCachedOnly(context, meetings)
+                }
                 if (cachedExperts.isNotEmpty()) expertSignals = cachedExperts
 
                 val loadedExperts = ExpertRepository.loadIncremental(context, meetings) { partial ->
-                    // Her uzman kaynağı geldikçe Predictor/RaceDetail otomatik recomposition ile yeniden hesaplanır.
+                    // Batch halinde gelen uzman sonucu UI state'ine tek atomik güncelleme olarak verilir.
                     expertSignals = partial
-                    HistoryStore.capture(context, meetings, partial)
+                    // JSON snapshot yazımı scroll/Main thread'i bloke etmesin.
+                    launch(Dispatchers.IO) { HistoryStore.capture(context, meetings, partial) }
                 }
                 expertSignals = loadedExperts
-                HistoryStore.capture(context, meetings, loadedExperts)
+                withContext(Dispatchers.IO) { HistoryStore.capture(context, meetings, loadedExperts) }
             }
         }
 
@@ -1632,7 +1668,7 @@ private fun TopHeader(onRefresh: () -> Unit, refreshing: Boolean, onHistory: () 
                 Image(
                     painter = painterResource(id = R.drawable.two_horse_logo),
                     contentDescription = "Two Horse",
-                    contentScale = ContentScale.Crop,
+                    contentScale = ContentScale.FillBounds,
                     modifier = Modifier.fillMaxSize().clip(RoundedCornerShape(16.dp))
                 )
             }
