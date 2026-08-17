@@ -1,0 +1,8 @@
+Two Horse v5.10 FINAL AUDIT
+- Expert rank is computed only from expert signals; AGF/HP/form/market cannot leak into Expert # rank.
+- Surprise tag no longer boosts expert ranking above ordinary support.
+- Multi-layout parser: direct horse text, same-line number lists, and safe adjacent-line label/list formats are supported.
+- Live expert scan progress is tracked separately from cached/reachable source counts; spinner ends only when current scan tasks complete.
+- Expert status labels Yorum verisi / Erisilen / Site acildi are emphasized.
+- Includes all v5.9 features.
+- Detail spinner is per-city, not global: once all 8 sources for the selected city have completed (success, timeout, or verified failure), the spinner stops even if another city's scan is still running.

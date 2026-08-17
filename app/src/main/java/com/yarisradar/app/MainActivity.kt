@@ -37,6 +37,9 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.SpanStyle
+import androidx.compose.ui.text.buildAnnotatedString
+import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -540,7 +543,8 @@ object ExpertRepository {
     suspend fun loadIncremental(
         context: Context,
         meetings: List<Meeting>,
-        onUpdate: suspend (Map<String, RaceExpertSignal>) -> Unit
+        onUpdate: suspend (Map<String, RaceExpertSignal>) -> Unit,
+        onProgress: suspend (city: String, completed: Int, total: Int) -> Unit = { _, _, _ -> }
     ): Map<String, RaceExpertSignal> = withContext(Dispatchers.IO) {
         if (meetings.isEmpty()) return@withContext emptyMap()
 
@@ -559,7 +563,10 @@ object ExpertRepository {
             // güvenilir verisini sırf diğerlerinden geç geldi diye kaybetmeyiz. Her HTTP isteğinin
             // kendi timeout/retry sınırı fetchSource/client içinde kalır.
             val resultChannel = Channel<Triple<String, Source, SourceDoc?>>(Channel.UNLIMITED)
-            val tasks = meetings.distinctBy { it.city }.flatMap { meeting ->
+            val scanCities = meetings.distinctBy { it.city }
+            val completedByCity = scanCities.associate { it.city to 0 }.toMutableMap()
+            scanCities.forEach { withContext(Dispatchers.Main.immediate) { onProgress(it.city, 0, sources.size) } }
+            val tasks = scanCities.flatMap { meeting ->
                 sources.map { source ->
                     launch(Dispatchers.IO) {
                         val fresh = withTimeoutOrNull(30_000L) {
@@ -612,6 +619,11 @@ object ExpertRepository {
                     // HTML expert aggregation/model input preparation stays off the Main thread.
                     val signals = withContext(Dispatchers.Default) { buildSignals(meetings, snapshot) }
                     withContext(Dispatchers.Main.immediate) { onUpdate(signals) }
+                }
+                batch.groupingBy { it.first }.eachCount().forEach { (city, count) ->
+                    val done = ((completedByCity[city] ?: 0) + count).coerceAtMost(sources.size)
+                    completedByCity[city] = done
+                    withContext(Dispatchers.Main.immediate) { onProgress(city, done, sources.size) }
                 }
             }
             resultChannel.close()
@@ -849,8 +861,13 @@ object ExpertRepository {
 
     private fun analyzeHorseText(text: String, horse: Horse, validNos: Set<Int>): ParsedHorseText {
         val needle = normalize(horse.name)
-        val favoriteBankoWords = listOf("banko", "tek", "favori", "favorim", "gunun teki", "gunun bankosu", "bankom")
-        val strongWords = (favoriteBankoWords + listOf("ilk sans", "ilk atim", "birinci sans", "cok sansli", "en sansli")).distinct()
+        val favoriteBankoWords = listOf(
+            "banko", "bankom", "bankomuz", "bankolar", "tek", "tekim", "tekimiz",
+            "favori", "favorim", "favoriler", "favorilerimiz", "gunun teki", "gunun bankosu"
+        )
+        val strongWords = (favoriteBankoWords + listOf(
+            "ilk sans", "ilk sansim", "ilk sanslar", "ilk atim", "birinci sans", "cok sansli", "en sansli"
+        )).distinct()
         val positiveWords = listOf("rakip", "ihmal edilmemeli", "oner", "sansli", "aday", "plase", "degerlendir", "kazanabilir")
         val surpriseWords = listOf("surpriz", "supriz", "bomba", "bombasi", "ters")
         val negativeWords = listOf("gelmez", "yazmam", "onermiyorum", "onermem", "sansini az", "sansi az", "sans vermiyorum", "dusunmuyorum", "yetersiz", "elenir", "elerim", "elemem")
@@ -871,15 +888,35 @@ object ExpertRepository {
             val rightPipe = text.indexOf('|', at + needle.length).takeIf { it >= 0 } ?: min(text.length, at + needle.length + 160)
             var from = max(0, leftPipe)
             var to = min(text.length, rightPipe)
-            // Pipe olmayan eski cache metninde komsu at adina kadar kisalt.
-            raceHorseBoundary@ for (otherNo in validNos) {
+            // Pipe olmayan eski cache metninde komsu at numarasina kadar kisalt.
+            for (otherNo in validNos) {
                 if (otherNo == horse.no) continue
                 val token = " $otherNo "
                 val pos = text.indexOf(token, at + needle.length)
                 if (pos in (at + needle.length + 1) until to) to = pos
             }
             if (to <= from) { from = max(0, at - 90); to = min(text.length, at + needle.length + 120) }
-            return text.substring(from, to)
+
+            var local = text.substring(from, to).trim()
+            // Siteler tek bir formata sahip değil. "Favorilerimiz | 6 BERMEDEE" veya
+            // "6 BERMEDEE | ilk şans" gibi iki komşu satıra bölünmüş ifadeleri de yakala.
+            // Yalnızca doğrudan komşu segment ve kısa etiket segmenti birleştirilir; böylece
+            // başka atın yorumu taşınmaz.
+            val segStart = text.lastIndexOf('|', at).let { if (it < 0) 0 else it + 1 }
+            val segEndRaw = text.indexOf('|', at + needle.length)
+            val segEnd = if (segEndRaw < 0) text.length else segEndRaw
+            val prevStartRaw = if (segStart > 0) text.lastIndexOf('|', max(0, segStart - 2)) else -1
+            val prev = if (segStart > 0) text.substring(if (prevStartRaw < 0) 0 else prevStartRaw + 1, segStart - 1).trim() else ""
+            val nextEndRaw = if (segEnd < text.length) text.indexOf('|', segEnd + 1) else -1
+            val next = if (segEnd < text.length) text.substring(segEnd + 1, if (nextEndRaw < 0) text.length else nextEndRaw).trim() else ""
+            val allLabels = (strongWords + positiveWords + surpriseWords + negativeWords).distinct()
+            fun labelOnly(seg: String): Boolean {
+                if (seg.isBlank() || seg.length > 70) return false
+                return allLabels.any { wholePhrase(seg, it) } && Regex("\\b\\d{1,2}\\b").findAll(seg).count() <= 1
+            }
+            if (labelOnly(prev)) local = "$prev | $local"
+            if (labelOnly(next)) local = "$local | $next"
+            return local
         }
 
         if (needle.length >= 4) {
@@ -949,6 +986,21 @@ object ExpertRepository {
                     val targetDist = numberMatches.filter { it.first == horseNo }.minOfOrNull { (_, pos) -> kotlin.math.abs(pos - labelCenter) }
                     // Hedef numara etikete en yakin grup icindeyse kabul et. Uzaktaki program/HP/AGF numaralarini alma.
                     if (targetDist != null && minDist != null && targetDist <= minDist + 8) return true
+                }
+
+                // Dağınık HTML örneği: "Favorilerimiz | 6 3 9". Etiket satırında numara yoksa
+                // yalnızca hemen sonraki kısa segmenti kullan; daha uzağa taşma, böylece başka karttan sinyal kaçmaz.
+                val labelSegEnd = text.indexOf('|', i).let { if (it < 0) text.length else it }
+                val labelSegStart = text.lastIndexOf('|', i).let { if (it < 0) 0 else it + 1 }
+                val labelSeg = text.substring(labelSegStart, labelSegEnd).trim()
+                if (wholePhrase(labelSeg, label) && Regex("\\b\\d{1,2}\\b").findAll(labelSeg).none()) {
+                    val nextEnd = text.indexOf('|', min(text.length, labelSegEnd + 1)).let { if (it < 0) text.length else it }
+                    if (labelSegEnd < text.length && nextEnd > labelSegEnd) {
+                        val nextSeg = text.substring(labelSegEnd + 1, nextEnd).trim()
+                        val nums = Regex("\\b\\d{1,2}\\b").findAll(nextSeg)
+                            .mapNotNull { it.value.toIntOrNull()?.takeIf { n -> n in validNos } }.toList().distinct()
+                        if (nums.size in 1..maxNumbers && horseNo in nums) return true
+                    }
                 }
                 i = text.indexOf(label, i + label.length)
             }
@@ -1326,24 +1378,17 @@ object Predictor {
         fun expertOnlyScore(signal: ExpertHorseSignal): Double {
             if (signal.totalSources <= 0) return Double.NEGATIVE_INFINITY
             val total = signal.totalSources.toDouble()
-            val ratio = signal.support / total
-            val strongRatio = signal.strongSupport / total
-            val favoriteBankoRatio = signal.favoriteBankoSupport / total
-            val surpriseRatio = signal.surpriseSupport / total
-            val negativeRatio = signal.negativeSupport / total
-            // Uzman sırası yalnız uzman görüşlerinden oluşur. Predictor'daki uzman bileşeniyle
-            // aynı mantık kullanılır: normal destek taban, güçlü ve favori/banko ek ağırlık,
-            // sürpriz küçük pozitif sinyal, olumsuz görüş ise düşürücü sinyaldir.
-            // Hiyerarsi: Favori/Banko > Güçlü > normal destek > sürpriz; olumsuz ciddi ceza.
-            // strong/support katmanli sinyallerdir; banko alan at ayni zamanda güçlü ve destekli sayilir.
-            return favoriteBankoRatio * 4.0 + strongRatio * 2.0 + ratio * 1.0 +
-                surpriseRatio * 0.25 - negativeRatio * 3.0
+            val fav = signal.favoriteBankoSupport / total
+            val strong = signal.strongSupport / total
+            val supportRatio = signal.support / total
+            val negative = signal.negativeSupport / total
+            // Uzman rank'ı SADECE uzman verisinden oluşur. AGF/HP/form/piyasa burada yoktur.
+            // Katmanlı sinyaller bilinçli olarak ağırlıklandırılır: ⭐ Favori/Banko > Güçlü > Destek.
+            // "Sürpriz" ayrı bir senaryo etiketidir; sırf sürpriz denildi diye normal desteğin önüne geçmez.
+            return fav * 5.0 + strong * 2.5 + supportRatio * 1.0 - negative * 4.0
         }
-        fun expertRank(h: Horse): Int? {
-            if ((expert?.sourceCount ?: 0) <= 0) return null
-            val own = support(h)
-            if (own.support <= 0 && own.favoriteBankoSupport <= 0 && own.strongSupport <= 0) return null
-            val ordered = race.horses
+        val expertRankMap: Map<Int, Int> = if ((expert?.sourceCount ?: 0) <= 0) emptyMap() else {
+            race.horses
                 .map { horse -> horse.no to support(horse) }
                 .filter { (_, signal) -> signal.support > 0 || signal.favoriteBankoSupport > 0 || signal.strongSupport > 0 }
                 .sortedWith(
@@ -1354,8 +1399,9 @@ object Predictor {
                         .thenBy { it.second.negativeSupport }
                         .thenBy { it.first }
                 )
-            return ordered.indexOfFirst { it.first == h.no }.takeIf { it >= 0 }?.plus(1)
+                .mapIndexed { index, pair -> pair.first to index + 1 }.toMap()
         }
+        fun expertRank(h: Horse): Int? = expertRankMap[h.no]
         fun formScore(last6: String): Double {
             val places = last6.filter { it in '1'..'9' }.map { it.digitToInt() }.takeLast(5)
             if (places.isEmpty()) return 0.0
@@ -1508,6 +1554,7 @@ fun TwoHorseApp() {
         var loading by remember { mutableStateOf(initialCache.isEmpty()) }
         var refreshing by remember { mutableStateOf(false) }
         var expertsRefreshing by remember { mutableStateOf(false) }
+        var expertProgressByCity by remember { mutableStateOf<Map<String, Pair<Int, Int>>>(emptyMap()) }
         var error by remember { mutableStateOf<String?>(null) }
         var selectedRace by remember { mutableStateOf<Race?>(null) }
         var historyOpen by remember { mutableStateOf(false) }
@@ -1566,6 +1613,7 @@ fun TwoHorseApp() {
             if (meetings.isNotEmpty()) {
                 val myCycle = ++expertScanCycle
                 expertsRefreshing = true
+                expertProgressByCity = meetings.distinctBy { it.city }.associate { it.city to (0 to 8) }
                 try {
                     // Yeni TJK programı geldiyse bile önce aynı günün uzman cache'ini göster.
                     val cachedExperts = withContext(Dispatchers.Default) {
@@ -1575,12 +1623,20 @@ fun TwoHorseApp() {
                     // Gelecek yarışların snapshot'ını hemen oluştur; canlı uzmanlar geldikçe yarış saatine kadar overwrite edilir.
                     withContext(Dispatchers.IO) { HistoryStore.capture(context, meetings, cachedExperts) }
 
-                    val loadedExperts = ExpertRepository.loadIncremental(context, meetings) { partial ->
-                        // Batch halinde gelen uzman sonucu UI state'ine tek atomik güncelleme olarak verilir.
-                        expertSignals = partial
-                        // JSON snapshot yazımı scroll/Main thread'i bloke etmesin.
-                        launch(Dispatchers.IO) { HistoryStore.capture(context, meetings, partial) }
-                    }
+                    val loadedExperts = ExpertRepository.loadIncremental(
+                        context, meetings,
+                        onUpdate = { partial ->
+                            // Batch halinde gelen uzman sonucu UI state'ine tek atomik güncelleme olarak verilir.
+                            expertSignals = partial
+                            // JSON snapshot yazımı scroll/Main thread'i bloke etmesin.
+                            launch(Dispatchers.IO) { HistoryStore.capture(context, meetings, partial) }
+                        },
+                        onProgress = { city, completed, total ->
+                            if (expertScanCycle == myCycle) {
+                                expertProgressByCity = expertProgressByCity + (city to (completed to total))
+                            }
+                        }
+                    )
                     expertSignals = loadedExperts
                     withContext(Dispatchers.IO) { HistoryStore.capture(context, meetings, loadedExperts) }
                 } finally {
@@ -1614,7 +1670,11 @@ fun TwoHorseApp() {
 
         Surface(Modifier.fillMaxSize(), color = Bg) {
             when {
-                selectedRace != null -> RaceDetail(selectedRace!!, expertSignals[raceKey(selectedRace!!)], expertsRefreshing, onBack = { selectedRace = null })
+                selectedRace != null -> {
+                    val progress = expertProgressByCity[selectedRace!!.city] ?: (0 to 8)
+                    val cityExpertsLoading = expertsRefreshing && progress.first < progress.second
+                    RaceDetail(selectedRace!!, expertSignals[raceKey(selectedRace!!)], cityExpertsLoading, progress.first, progress.second, onBack = { selectedRace = null })
+                }
                 selectedHistory != null -> HistoryDetail(selectedHistory!!, onBack = { selectedHistory = null })
                 historyOpen -> HistoryScreen(context, onBack = { historyOpen = false }, onOpen = { selectedHistory = it })
                 sixliOpen -> SixliScreen(meetings, expertSignals, expertsRefreshing, onBack = { sixliOpen = false }, onRace = { selectedRace = it })
@@ -2252,7 +2312,7 @@ private fun ScoreBadge(score: Int) {
 }
 
 @Composable
-fun RaceDetail(race: Race, expert: RaceExpertSignal?, expertsRefreshing: Boolean, onBack: () -> Unit) {
+fun RaceDetail(race: Race, expert: RaceExpertSignal?, expertsRefreshing: Boolean, expertCompleted: Int, expertTotal: Int, onBack: () -> Unit) {
     val picks = remember(race, expert) { Predictor.picks(race, expert) }
     val surprise = picks.firstOrNull { it.label == "Sürpriz" } ?: picks.getOrNull(2)
     val compact = LocalConfiguration.current.screenWidthDp < 360
@@ -2293,7 +2353,7 @@ fun RaceDetail(race: Race, expert: RaceExpertSignal?, expertsRefreshing: Boolean
             }
         }
         if (picks.isNotEmpty()) {
-            item { ExpertStatusCard(expert, expertsRefreshing) }
+            item { ExpertStatusCard(expert, expertsRefreshing, expertCompleted, expertTotal) }
             item { ResultHero(picks.first(), picks.getOrNull(1), surprise) }
             item { SectionTitle("Olası sıralama · tüm atlar") }
             items(picks, key = { it.horse.no }) { pick -> HorseCard(pick) }
@@ -2310,7 +2370,7 @@ fun RaceDetail(race: Race, expert: RaceExpertSignal?, expertsRefreshing: Boolean
 }
 
 @Composable
-private fun ExpertStatusCard(expert: RaceExpertSignal?, loading: Boolean) {
+private fun ExpertStatusCard(expert: RaceExpertSignal?, loading: Boolean, completed: Int, totalTasks: Int) {
     val configured = expert?.configuredSourceCount ?: 8
     val reachable = expert?.reachableSourceCount ?: 0
     val usable = expert?.sourceCount ?: 0
@@ -2342,7 +2402,10 @@ private fun ExpertStatusCard(expert: RaceExpertSignal?, loading: Boolean) {
                 }
                 Spacer(Modifier.width(6.dp))
                 Text(
-                    "$reachable/$configured siteye ulaşıldı · $usable/$configured bu koşuda yorum bulundu",
+                    if (loading && totalTasks > 0)
+                        "Canlı tarama: ${completed.coerceAtMost(totalTasks)}/$totalTasks kaynak tamamlandı · $usable/$configured bu koşuda yorum"
+                    else
+                        "$reachable/$configured siteye ulaşıldı · $usable/$configured bu koşuda yorum bulundu",
                     color = if (usable > 0) Green else Muted, fontWeight = FontWeight.Bold, fontSize = 10.sp,
                     maxLines = 2, overflow = TextOverflow.Ellipsis
                 )
@@ -2354,10 +2417,15 @@ private fun ExpertStatusCard(expert: RaceExpertSignal?, loading: Boolean) {
             if (reachable > 0) {
                 Spacer(Modifier.height(4.dp))
                 Text(
-                    buildString {
-                        append("Yorum verisi: $fresh canlı")
+                    buildAnnotatedString {
+                        withStyle(SpanStyle(fontWeight = FontWeight.Bold)) { append("Yorum verisi:") }
+                        append(" $fresh canlı")
                         if (cached > 0) append(" · $cached önbellekten")
-                        expert?.reachableSources?.takeIf { it.isNotEmpty() }?.let { append(" · Erişilen: "); append(it.joinToString(", ")) }
+                        expert?.reachableSources?.takeIf { it.isNotEmpty() }?.let {
+                            append(" · ")
+                            withStyle(SpanStyle(fontWeight = FontWeight.Bold)) { append("Erişilen:") }
+                            append(" ${it.joinToString(", ")}")
+                        }
                     },
                     color = Muted, fontSize = 9.sp, maxLines = 3, overflow = TextOverflow.Ellipsis
                 )
@@ -2367,7 +2435,13 @@ private fun ExpertStatusCard(expert: RaceExpertSignal?, loading: Boolean) {
                 }
                 expert?.unusableSources?.takeIf { it.isNotEmpty() }?.let { names ->
                     Spacer(Modifier.height(2.dp))
-                    Text("Site açıldı, bu koşunun yorumu doğrulanamadı: ${names.joinToString(", ")}", color = Muted, fontSize = 8.sp, maxLines = 2, overflow = TextOverflow.Ellipsis)
+                    Text(
+                        buildAnnotatedString {
+                            withStyle(SpanStyle(fontWeight = FontWeight.Bold)) { append("Site açıldı, bu koşunun yorumu doğrulanamadı:") }
+                            append(" ${names.joinToString(", ")}")
+                        },
+                        color = Muted, fontSize = 8.sp, maxLines = 2, overflow = TextOverflow.Ellipsis
+                    )
                 }
             } else {
                 Spacer(Modifier.height(4.dp))
