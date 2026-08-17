@@ -1,6 +1,8 @@
 package com.yarisradar.app
 
 import android.os.Bundle
+import android.content.Intent
+import android.net.Uri
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
@@ -19,6 +21,7 @@ import androidx.compose.material.icons.filled.CloudOff
 import androidx.compose.material.icons.filled.KeyboardArrowDown
 import androidx.compose.material.icons.filled.KeyboardArrowUp
 import androidx.compose.material.icons.filled.Refresh
+import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Stars
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
@@ -32,6 +35,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.platform.LocalConfiguration
+import androidx.compose.ui.platform.LocalContext
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
@@ -80,7 +84,8 @@ data class Horse(
     val best: String = "",
     val odds: Double? = null,
     val agf: Int? = null,
-    val start: Int? = null
+    val start: Int? = null,
+    val videoUrl: String? = null
 )
 
 data class Race(
@@ -332,6 +337,16 @@ object TjkRepository {
             val agf = Regex("%?\\s*(\\d{1,3})(?:[,.]\\d+)?")
                 .find(agfText)?.groupValues?.getOrNull(1)?.toIntOrNull()?.takeIf { it in 0..100 }
 
+            val directVideo = row.select("a[href]").firstOrNull { a ->
+                val href = a.attr("href")
+                href.contains("YarisVideoAt", true) && href.contains("AtKodu", true)
+            }?.let { a ->
+                a.attr("abs:href").ifBlank {
+                    val href = a.attr("href")
+                    if (href.startsWith("http", true)) href else BASE + if (href.startsWith('/')) href else "/$href"
+                }
+            }
+
             Horse(
                 no = no,
                 name = name,
@@ -342,7 +357,8 @@ object TjkRepository {
                 best = clean(cell(iBest)).lineSequence().firstOrNull().orEmpty(),
                 odds = numericDouble(cell(iOdds)),
                 agf = agf,
-                start = firstInt(cell(iStart))
+                start = firstInt(cell(iStart)),
+                videoUrl = directVideo
             )
         }.distinctBy { it.no }
     }
@@ -405,14 +421,12 @@ object Predictor {
             val normalized = if (maxRaw == minRaw) 70 else
                 (54 + ((item.second.first - minRaw) / (maxRaw - minRaw)) * 40).toInt().coerceIn(45, 94)
             val agf = item.first.agf ?: 0
-        val hp = item.first.hp
-        val weight = item.first.weight
             val reasons = item.second.second.toMutableList()
             if (reasons.isEmpty()) {
                 when {
                     agf in 1..8 -> reasons += "AGF desteği sınırlı; sürpriz senaryosunda değerlendirilir"
-                    hp != null && hp < maxHp - 10 -> reasons += "HP rakiplerin gerisinde; yarış temposuna ihtiyaç duyabilir"
-                    weight != null && weight > minWeight + 3 -> reasons += "kilo dezavantajı var"
+                    item.first.hp != null && item.first.hp < maxHp - 10 -> reasons += "HP rakiplerin gerisinde; yarış temposuna ihtiyaç duyabilir"
+                    item.first.weight != null && item.first.weight > minWeight + 3 -> reasons += "kilo dezavantajı var"
                     else -> reasons += "belirgin üstünlük yok; yarış içi tempo ve pozisyon belirleyici"
                 }
             }
@@ -724,7 +738,7 @@ private fun SectionHeader(title: String, subtitle: String) {
 @Composable
 private fun CityFilter(cities: List<String>, selected: String, onSelect: (String) -> Unit) {
     Column(Modifier.padding(top = 8.dp)) {
-        Text("Şehirler", fontWeight = FontWeight.Black, fontSize = 17.sp, color = Ink)
+        Text("Kalan diğer şehir yarışları", fontWeight = FontWeight.Black, fontSize = 17.sp, color = Ink)
         Spacer(Modifier.height(9.dp))
         androidx.compose.foundation.lazy.LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             items(cities) { city ->
@@ -949,6 +963,24 @@ private fun HorseCard(p: Pick) {
                 if (p.reasons.isNotEmpty()) {
                     Spacer(Modifier.height(7.dp))
                     Text(p.reasons.joinToString(" · "), color = Muted, fontSize = 11.sp)
+                }
+                p.horse.videoUrl?.let { videoUrl ->
+                    val context = LocalContext.current
+                    Spacer(Modifier.height(9.dp))
+                    OutlinedButton(
+                        onClick = {
+                            runCatching {
+                                context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(videoUrl)))
+                            }
+                        },
+                        shape = RoundedCornerShape(12.dp),
+                        contentPadding = PaddingValues(horizontal = 11.dp, vertical = 7.dp)
+                    ) {
+                        Icon(Icons.Default.PlayArrow, contentDescription = null, modifier = Modifier.size(16.dp))
+                        Spacer(Modifier.width(5.dp))
+                        Text("Son yarış videoları", fontWeight = FontWeight.Bold, fontSize = 10.sp)
+                    }
+                    Text("TJK resmi video arşivi · son 3 yarışı buradan aç", color = Muted, fontSize = 9.sp)
                 }
             }
         }
