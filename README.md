@@ -1,4 +1,4 @@
-# Two Horse 4.3 PRO
+# Two Horse 4.4 PRO
 
 - 7-source expert consensus: HorseTurk, Banko Tahminler, Yabancı Ganyan, Liderform, Yarış Dergisi, Ganyan Canavarı, Puanlı Altılı Bülten.
 - Sources are queried concurrently and never block the TJK race program UI.

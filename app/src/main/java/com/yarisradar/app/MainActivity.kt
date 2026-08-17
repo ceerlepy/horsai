@@ -113,7 +113,12 @@ data class Meeting(
 data class ExpertHorseSignal(
     val support: Int = 0,
     val totalSources: Int = 0,
-    val sources: List<String> = emptyList()
+    val sources: List<String> = emptyList(),
+    val strongSupport: Int = 0,
+    val surpriseSupport: Int = 0,
+    val negativeSupport: Int = 0,
+    val sahaScore: Int = 0,
+    val sahaNotes: List<String> = emptyList()
 )
 
 data class RaceExpertSignal(
@@ -136,6 +141,11 @@ data class Pick(
     val expertSupport: Int = 0,
     val expertTotal: Int = 0,
     val expertSources: List<String> = emptyList(),
+    val expertStrong: Int = 0,
+    val expertSurprise: Int = 0,
+    val expertNegative: Int = 0,
+    val sahaScore: Int = 0,
+    val sahaNotes: List<String> = emptyList(),
     val marketLabel: String = "Belirsiz",
     val formLabel: String = "→ Dengeli"
 )
@@ -402,16 +412,23 @@ object ExpertRepository {
                     val docs = cityDocs[meeting.city].orEmpty()
                     meeting.races.forEach { race ->
                         val supports = mutableMapOf<Int, MutableList<String>>()
+                        val strongs = mutableMapOf<Int, MutableList<String>>()
+                        val surprises = mutableMapOf<Int, MutableList<String>>()
+                        val negatives = mutableMapOf<Int, MutableList<String>>()
+                        val sahaScores = mutableMapOf<Int, Int>()
+                        val sahaNotes = mutableMapOf<Int, MutableList<String>>()
+                        val validNos = race.horses.map { it.no }.toSet()
                         docs.forEach { doc ->
                             val raceText = raceSection(doc.text, race.number)
                             race.horses.forEach { horse ->
-                                val needle = normalize(horse.name)
-                                val supported = if (doc.source.strongOnly) {
-                                    strongMention(raceText, needle)
-                                } else {
-                                    horseMention(raceText, needle)
-                                }
-                                if (supported) supports.getOrPut(horse.no) { mutableListOf() }.add(doc.source.name)
+                                val signal = analyzeHorseText(raceText, horse, validNos)
+                                val positive = if (doc.source.strongOnly) signal.strong else signal.positive
+                                if (positive && !signal.negative) supports.getOrPut(horse.no) { mutableListOf() }.add(doc.source.name)
+                                if (signal.strong && !signal.negative) strongs.getOrPut(horse.no) { mutableListOf() }.add(doc.source.name)
+                                if (signal.surprise && !signal.negative) surprises.getOrPut(horse.no) { mutableListOf() }.add(doc.source.name)
+                                if (signal.negative) negatives.getOrPut(horse.no) { mutableListOf() }.add(doc.source.name)
+                                if (signal.sahaScore != 0) sahaScores[horse.no] = (sahaScores[horse.no] ?: 0) + signal.sahaScore
+                                if (signal.sahaNotes.isNotEmpty()) sahaNotes.getOrPut(horse.no) { mutableListOf() }.addAll(signal.sahaNotes)
                             }
                         }
                         val freshCount = docs.count { it.fresh }
@@ -424,7 +441,16 @@ object ExpertRepository {
                             activeSources = docs.map { it.source.name },
                             byHorse = race.horses.associate { horse ->
                                 val src = supports[horse.no].orEmpty().distinct()
-                                horse.no to ExpertHorseSignal(src.size, docs.size, src)
+                                horse.no to ExpertHorseSignal(
+                                    support = src.size,
+                                    totalSources = docs.size,
+                                    sources = src,
+                                    strongSupport = strongs[horse.no].orEmpty().distinct().size,
+                                    surpriseSupport = surprises[horse.no].orEmpty().distinct().size,
+                                    negativeSupport = negatives[horse.no].orEmpty().distinct().size,
+                                    sahaScore = sahaScores[horse.no] ?: 0,
+                                    sahaNotes = sahaNotes[horse.no].orEmpty().distinct().take(4)
+                                )
                             }
                         ))
                     }
@@ -507,6 +533,83 @@ object ExpertRepository {
         val ends = listOf("$next kosu", "$next. kosu", "${next}kosu").map { text.indexOf(it, start + 4) }.filter { it > start }
         val end = ends.minOrNull() ?: min(text.length, start + 4500)
         return text.substring(start, end)
+    }
+
+    private data class ParsedHorseText(
+        val positive: Boolean = false,
+        val strong: Boolean = false,
+        val surprise: Boolean = false,
+        val negative: Boolean = false,
+        val sahaScore: Int = 0,
+        val sahaNotes: List<String> = emptyList()
+    )
+
+    private fun analyzeHorseText(text: String, horse: Horse, validNos: Set<Int>): ParsedHorseText {
+        val needle = normalize(horse.name)
+        val strongWords = listOf("banko", "tek", "favori", "ilk sans", "ilk atim", "birinci sans", "gunun teki")
+        val positiveWords = listOf("rakip", "ihmal edilmemeli", "oner", "sansli", "aday", "plase", "degerlendir", "kazanabilir")
+        val surpriseWords = listOf("surpriz", "supriz", "bomba", "bombasi", "ters")
+        val negativeWords = listOf("gelmez", "yazmam", "onermiyorum", "sansini az", "sansi az", "dusunmuyorum", "yetersiz", "ele")
+
+        var directStrong = false
+        var directPositive = false
+        var directSurprise = false
+        var directNegative = false
+        val notes = mutableListOf<String>()
+        var saha = 0
+
+        if (needle.length >= 4) {
+            var start = text.indexOf(needle)
+            while (start >= 0) {
+                val from = max(0, start - 180)
+                val end = min(text.length, start + needle.length + 320)
+                val snippet = text.substring(from, end)
+                directStrong = directStrong || strongWords.any { snippet.contains(it) } || Regex("★{3,5}").containsMatchIn(snippet)
+                directSurprise = directSurprise || surpriseWords.any { snippet.contains(it) }
+                directPositive = directPositive || directStrong || directSurprise || positiveWords.any { snippet.contains(it) }
+                directNegative = directNegative || negativeWords.any { snippet.contains(it) }
+
+                if (listOf("jokeyiyle daha once yaris kazan", "ayni jokeyle daha once kazan", "bu jokeyle daha once kazan").any { snippet.contains(it) }) {
+                    saha += 3; notes += "Aynı jokeyle daha önce kazanmış"
+                }
+                if (listOf("sadece o ata binecek jokey", "yalniz bu ata binecek jokey", "jokey sadece bu ata binecek").any { snippet.contains(it) }) {
+                    saha += 1; notes += "Jokey gün içinde yalnız bu ata biniyor"
+                }
+                if (listOf("taki degisikligi", "aksesuar degisikligi").any { snippet.contains(it) }) {
+                    notes += "Takı değişikliği var"
+                }
+                if (listOf("sehir degisikligi", "hipodrom degisikligi").any { snippet.contains(it) }) {
+                    notes += "Şehir/hipodrom değişikliği var"
+                }
+                start = text.indexOf(needle, start + needle.length)
+            }
+        }
+
+        val listStrong = numberRecommendation(text, horse.no, validNos, strongWords)
+        val listPositive = numberRecommendation(text, horse.no, validNos, positiveWords)
+        val listSurprise = numberRecommendation(text, horse.no, validNos, surpriseWords)
+        val listNegative = numberRecommendation(text, horse.no, validNos, negativeWords)
+        val negative = directNegative || listNegative
+        val strong = directStrong || listStrong
+        val surprise = directSurprise || listSurprise
+        val positive = directPositive || listPositive || strong || surprise
+        return ParsedHorseText(positive, strong, surprise, negative, saha.coerceIn(-4, 6), notes.distinct())
+    }
+
+    private fun numberRecommendation(text: String, horseNo: Int, validNos: Set<Int>, labels: List<String>): Boolean {
+        labels.forEach { label ->
+            var i = text.indexOf(label)
+            while (i >= 0) {
+                val from = max(0, i - 90)
+                val end = min(text.length, i + label.length + 110)
+                val snippet = text.substring(from, end)
+                val nums = Regex("\\b\\d{1,2}\\b").findAll(snippet).mapNotNull { it.value.toIntOrNull() }
+                    .filter { it in validNos }.toSet()
+                if (horseNo in nums) return true
+                i = text.indexOf(label, i + label.length)
+            }
+        }
+        return false
     }
 
     private fun horseMention(text: String, needle: String): Boolean {
@@ -898,8 +1001,18 @@ object Predictor {
             val ex = support(h)
             if (ex.totalSources > 0) {
                 val ratio = ex.support.toDouble() / ex.totalSources
-                score += ratio * 17
+                val strongRatio = ex.strongSupport.toDouble() / ex.totalSources
+                val surpriseRatio = ex.surpriseSupport.toDouble() / ex.totalSources
+                val negativeRatio = ex.negativeSupport.toDouble() / ex.totalSources
+                score += ratio * 12
+                score += strongRatio * 5
+                score += surpriseRatio * 2
+                score -= negativeRatio * 8
+                score += ex.sahaScore.coerceIn(-4, 6) * .7
                 if (ex.support > 0) reasons += "uzman desteği ${ex.support}/${ex.totalSources}"
+                if (ex.strongSupport > 0) reasons += "${ex.strongSupport} güçlü uzman sinyali"
+                if (ex.negativeSupport > 0) reasons += "${ex.negativeSupport} olumsuz uzman görüşü"
+                if (ex.sahaNotes.isNotEmpty()) reasons += ex.sahaNotes.first()
             }
             h to (score to reasons)
         }
@@ -948,6 +1061,11 @@ object Predictor {
                 expertSupport = ex.support,
                 expertTotal = ex.totalSources,
                 expertSources = ex.sources,
+                expertStrong = ex.strongSupport,
+                expertSurprise = ex.surpriseSupport,
+                expertNegative = ex.negativeSupport,
+                sahaScore = ex.sahaScore,
+                sahaNotes = ex.sahaNotes,
                 marketLabel = market,
                 formLabel = formLabel(h.last6)
             )
@@ -1486,9 +1604,17 @@ private fun ResultHero(favorite: Pick, rival: Pick?, surprise: Pick?) {
                 "Uzman desteği",
                 if (favorite.expertTotal > 0) {
                     val rank = favorite.expertRank?.let { "#$it · " }.orEmpty()
-                    "$rank${favorite.expertSupport}/${favorite.expertTotal} kaynak"
+                    buildString {
+                        append("$rank${favorite.expertSupport}/${favorite.expertTotal} kaynak")
+                        if (favorite.expertStrong > 0) append(" · ${favorite.expertStrong} güçlü")
+                        if (favorite.expertSurprise > 0) append(" · ${favorite.expertSurprise} sürpriz")
+                        if (favorite.expertNegative > 0) append(" · ${favorite.expertNegative} olumsuz")
+                    }
                 } else "Kaynak bekleniyor / bulunamadı"
             )
+            if (favorite.sahaNotes.isNotEmpty()) {
+                MetricLine("Saha", favorite.sahaNotes.joinToString(" · "))
+            }
             if (favorite.expertSources.isNotEmpty()) {
                 Text("Kaynaklar: ${favorite.expertSources.joinToString(", ")}", color = Color.White.copy(.55f), fontSize = 9.sp)
             }
@@ -1576,8 +1702,14 @@ private fun HorseCard(p: Pick) {
                 DetailMetric("HP", p.hpRank?.let { "#$it · ${p.horse.hp ?: 0}" } ?: "—")
                 DetailMetric(
                     "Uzman",
-                    if (p.expertTotal > 0) "${p.expertRank?.let { "#$it · " }.orEmpty()}${p.expertSupport}/${p.expertTotal}" else "—"
+                    if (p.expertTotal > 0) buildString {
+                        append("${p.expertRank?.let { "#$it · " }.orEmpty()}${p.expertSupport}/${p.expertTotal}")
+                        if (p.expertStrong > 0) append(" · ${p.expertStrong} güçlü")
+                        if (p.expertSurprise > 0) append(" · ${p.expertSurprise} sürpriz")
+                        if (p.expertNegative > 0) append(" · ${p.expertNegative} olumsuz")
+                    } else "—"
                 )
+                if (p.sahaNotes.isNotEmpty()) DetailMetric("Saha", p.sahaNotes.joinToString(" · "))
                 DetailMetric("Piyasa", p.marketLabel)
                 DetailMetric("Form", p.formLabel)
                 if (p.reasons.isNotEmpty()) {
