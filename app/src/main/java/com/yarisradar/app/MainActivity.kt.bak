@@ -1,7 +1,6 @@
 package com.yarisradar.app
 
 import android.os.Bundle
-import android.content.Context
 import android.content.Intent
 import android.net.Uri
 import androidx.activity.ComponentActivity
@@ -44,13 +43,9 @@ import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
-import kotlinx.coroutines.withTimeoutOrNull
-import kotlinx.coroutines.supervisorScope
 import org.jsoup.Jsoup
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
-import org.json.JSONArray
-import org.json.JSONObject
 import java.net.URLEncoder
 import java.text.SimpleDateFormat
 import java.util.Calendar
@@ -110,458 +105,8 @@ data class Meeting(
     val races: List<Race>
 )
 
-data class ExpertHorseSignal(
-    val support: Int = 0,
-    val totalSources: Int = 0,
-    val sources: List<String> = emptyList()
-)
+data class Pick(val horse: Horse, val score: Int, val label: String, val reasons: List<String>)
 
-data class RaceExpertSignal(
-    val sourceCount: Int = 0,
-    val configuredSourceCount: Int = 0,
-    val freshSourceCount: Int = 0,
-    val cachedSourceCount: Int = 0,
-    val activeSources: List<String> = emptyList(),
-    val byHorse: Map<Int, ExpertHorseSignal> = emptyMap()
-)
-
-data class Pick(
-    val horse: Horse,
-    val score: Int,
-    val label: String,
-    val reasons: List<String>,
-    val agfRank: Int? = null,
-    val hpRank: Int? = null,
-    val expertRank: Int? = null,
-    val expertSupport: Int = 0,
-    val expertTotal: Int = 0,
-    val expertSources: List<String> = emptyList(),
-    val marketLabel: String = "Belirsiz",
-    val formLabel: String = "→ Dengeli"
-)
-
-private fun raceKey(race: Race): String = "${race.city}|${race.number}"
-
-data class RaceVideo(val label: String, val url: String)
-
-object VideoRepository {
-    private val client by lazy {
-        okhttp3.OkHttpClient.Builder()
-            .connectTimeout(4, java.util.concurrent.TimeUnit.SECONDS)
-            .readTimeout(6, java.util.concurrent.TimeUnit.SECONDS)
-            .callTimeout(8, java.util.concurrent.TimeUnit.SECONDS)
-            .retryOnConnectionFailure(false)
-            .build()
-    }
-
-    suspend fun loadLast3(startUrl: String): List<RaceVideo> = withContext(Dispatchers.IO) {
-        withTimeoutOrNull(8500) {
-            runCatching {
-                val req = okhttp3.Request.Builder().url(startUrl)
-                    .header("User-Agent", "Mozilla/5.0 (Linux; Android 15; Mobile) AppleWebKit/537.36 Chrome/140 Mobile Safari/537.36")
-                    .header("Accept-Language", "tr-TR,tr;q=0.9")
-                    .build()
-                client.newCall(req).execute().use { r ->
-                    if (!r.isSuccessful) {
-                        emptyList()
-                    } else {
-                        val html = r.body?.string().orEmpty()
-                        val doc = Jsoup.parse(html, r.request.url.toString())
-                        val links = doc.select("a[href]").mapNotNull { a ->
-                            val href = a.attr("abs:href").ifBlank { a.attr("href") }
-                            if (!href.contains("YarisVideo", true)) return@mapNotNull null
-                            val label = a.text().replace(Regex("\\s+"), " ").trim()
-                            RaceVideo(label.ifBlank { "TJK yarış videosu" }, href)
-                        }.distinctBy { it.url }
-                        if (links.isNotEmpty()) links.take(3) else listOf(RaceVideo("TJK video arşivi", startUrl))
-                    }
-                }
-            }.getOrDefault(emptyList())
-        } ?: emptyList()
-    }
-}
-
-object MeetingCache {
-    private const val PREF = "two_horse_cache"
-    private const val KEY = "today_meetings"
-    private const val KEY_DATE = "cache_date"
-
-    fun load(context: Context): List<Meeting> {
-        return runCatching {
-            val prefs = context.getSharedPreferences(PREF, Context.MODE_PRIVATE)
-            val today = turkishDate()
-            if (prefs.getString(KEY_DATE, null) != today) return emptyList()
-            val raw = prefs.getString(KEY, null).orEmpty()
-            if (raw.isBlank()) return emptyList()
-            val arr = JSONArray(raw)
-            buildList {
-                for (i in 0 until arr.length()) {
-                    val m = arr.getJSONObject(i)
-                    val racesArr = m.getJSONArray("races")
-                    val races = buildList {
-                        for (r in 0 until racesArr.length()) {
-                            val ro = racesArr.getJSONObject(r)
-                            val horsesArr = ro.getJSONArray("horses")
-                            val horses = buildList {
-                                for (h in 0 until horsesArr.length()) {
-                                    val ho = horsesArr.getJSONObject(h)
-                                    add(Horse(
-                                        no = ho.getInt("no"),
-                                        name = ho.getString("name"),
-                                        weight = ho.optDoubleOrNull("weight"),
-                                        jockey = ho.optString("jockey"),
-                                        hp = ho.optIntOrNull("hp"),
-                                        last6 = ho.optString("last6"),
-                                        best = ho.optString("best"),
-                                        odds = ho.optDoubleOrNull("odds"),
-                                        agf = ho.optIntOrNull("agf"),
-                                        start = ho.optIntOrNull("start"),
-                                        videoUrl = ho.optString("videoUrl").takeIf { it.isNotBlank() }
-                                    ))
-                                }
-                            }
-                            add(Race(
-                                number = ro.getInt("number"),
-                                time = ro.getString("time"),
-                                title = ro.getString("title"),
-                                distance = ro.optString("distance"),
-                                surface = ro.optString("surface"),
-                                horses = horses,
-                                city = ro.optString("city")
-                            ))
-                        }
-                    }
-                    add(Meeting(m.getString("city"), m.getString("date"), m.optString("trackInfo"), races))
-                }
-            }
-        }.getOrDefault(emptyList())
-    }
-
-    fun save(context: Context, meetings: List<Meeting>) {
-        runCatching {
-            val arr = JSONArray()
-            meetings.forEach { m ->
-                val races = JSONArray()
-                m.races.forEach { r ->
-                    val horses = JSONArray()
-                    r.horses.forEach { h ->
-                        horses.put(JSONObject().apply {
-                            put("no", h.no); put("name", h.name)
-                            h.weight?.let { put("weight", it) }; put("jockey", h.jockey)
-                            h.hp?.let { put("hp", it) }; put("last6", h.last6); put("best", h.best)
-                            h.odds?.let { put("odds", it) }; h.agf?.let { put("agf", it) }
-                            h.start?.let { put("start", it) }; put("videoUrl", h.videoUrl ?: "")
-                        })
-                    }
-                    races.put(JSONObject().apply {
-                        put("number", r.number); put("time", r.time); put("title", r.title)
-                        put("distance", r.distance); put("surface", r.surface); put("city", r.city)
-                        put("horses", horses)
-                    })
-                }
-                arr.put(JSONObject().apply {
-                    put("city", m.city); put("date", m.date); put("trackInfo", m.trackInfo); put("races", races)
-                })
-            }
-            context.getSharedPreferences(PREF, Context.MODE_PRIVATE).edit()
-                .putString(KEY_DATE, turkishDate()).putString(KEY, arr.toString()).apply()
-        }
-    }
-
-    private fun turkishDate(): String = SimpleDateFormat("dd/MM/yyyy", Locale.US).apply {
-        timeZone = java.util.TimeZone.getTimeZone("Europe/Istanbul")
-    }.format(Date())
-
-    private fun JSONObject.optIntOrNull(key: String): Int? = if (has(key) && !isNull(key)) optInt(key) else null
-    private fun JSONObject.optDoubleOrNull(key: String): Double? = if (has(key) && !isNull(key)) optDouble(key) else null
-}
-
-object ExpertRepository {
-    private data class Source(
-        val name: String,
-        val strongOnly: Boolean = false,
-        val candidates: (String, String) -> List<String>,
-        val discoveryPages: (String, String) -> List<String>
-    )
-    private data class SourceDoc(val source: Source, val text: String, val fresh: Boolean)
-
-    private const val PREF = "two_horse_expert_cache_v2"
-    private val months = listOf("ocak", "subat", "mart", "nisan", "mayis", "haziran", "temmuz", "agustos", "eylul", "ekim", "kasim", "aralik")
-    private val client by lazy {
-        okhttp3.OkHttpClient.Builder()
-            .connectTimeout(2500, java.util.concurrent.TimeUnit.MILLISECONDS)
-            .readTimeout(3500, java.util.concurrent.TimeUnit.MILLISECONDS)
-            .callTimeout(4500, java.util.concurrent.TimeUnit.MILLISECONDS)
-            .retryOnConnectionFailure(false)
-            .build()
-    }
-
-    private val sources = listOf(
-        Source(
-            name = "HorseTurk",
-            candidates = { city, date ->
-                val (d, m, y) = dateParts(date)
-                listOf(
-                    "https://www.horseturk.com/at-yarisi-tahminleri-${slug(city)}-$d-${months[m-1]}-$y/",
-                    "https://www.horseturk.com/?s=${urlEncode("$city $d ${months[m-1]} $y")}" 
-                )
-            },
-            discoveryPages = { _, _ -> listOf("https://www.horseturk.com/") }
-        ),
-        Source(
-            name = "Banko Tahminler",
-            candidates = { city, date ->
-                val (d, m, y) = dateParts(date)
-                listOf(
-                    "https://www.bankotahminler.com/ai-tahmin/$d-${months[m-1]}-$y-${slug(city)}/",
-                    "https://www.bankotahminler.com/ai-tahmin/$d-${months[m-1]}-$y/"
-                )
-            },
-            discoveryPages = { _, _ -> listOf("https://www.bankotahminler.com/ai-tahmin/") }
-        ),
-        Source(
-            name = "Yabancı Ganyan",
-            strongOnly = true,
-            candidates = { city, date ->
-                val (d, m, y) = dateParts(date)
-                listOf(
-                    "https://www.yabanciganyan.com/gunluk-analiz/${slug(city)}-at-yarisi-tahminleri-$d-${months[m-1]}-$y/",
-                    "https://www.yabanciganyan.com/hipodrom/${slug(city)}/program/${date.replace('/', '-')}/"
-                )
-            },
-            discoveryPages = { _, _ -> listOf("https://www.yabanciganyan.com/gunluk-analiz/") }
-        ),
-        Source(
-            name = "Liderform",
-            candidates = { city, date ->
-                val (d, m, y) = dateParts(date)
-                listOf(
-                    "https://liderform.com.tr/program/$y-${m.toString().padStart(2,'0')}-${d.toString().padStart(2,'0')}/${slug(city)}",
-                    "https://liderform.com.tr/haberler/analizler"
-                )
-            },
-            discoveryPages = { _, _ -> listOf("https://liderform.com.tr/haberler/analizler", "https://liderform.com.tr/") }
-        ),
-        Source(
-            name = "Yarış Dergisi",
-            candidates = { city, date ->
-                val (d, m, y) = dateParts(date)
-                listOf(
-                    "https://www.yarisdergisi.com/?s=${urlEncode("$city $d ${months[m-1]} $y")}",
-                    "https://www.yarisdergisi.com/?s=${urlEncode("$city tahmin")}" 
-                )
-            },
-            discoveryPages = { _, _ -> listOf("https://www.yarisdergisi.com/") }
-        ),
-        Source(
-            name = "Ganyan Canavarı",
-            candidates = { city, date ->
-                val (d, m, y) = dateParts(date)
-                val cityId = ganyanCityId(city)
-                buildList {
-                    if (cityId != null) add("https://www.ganyancanavari.com.tr/site/$y/${m.toString().padStart(2,'0')}/${d.toString().padStart(2,'0')}/$cityId/${slug(city)}/gecmis-dereceler.html")
-                    add("https://www.ganyancanavari.com.tr/?q=${urlEncode("$city $d ${months[m-1]} $y")}")
-                }
-            },
-            discoveryPages = { _, _ -> listOf("https://www.ganyancanavari.com.tr/") }
-        ),
-        Source(
-            name = "Puanlı Altılı Bülten",
-            candidates = { city, date ->
-                val (d, m, y) = dateParts(date)
-                listOf(
-                    "https://puanlialtilibulten.blogspot.com/search?q=${urlEncode("$city $d ${months[m-1]} $y")}",
-                    "https://puanlialtilibulten.blogspot.com/search?q=${urlEncode(city)}"
-                )
-            },
-            discoveryPages = { _, _ -> listOf("https://puanlialtilibulten.blogspot.com/") }
-        )
-    )
-
-    suspend fun load(context: Context, meetings: List<Meeting>): Map<String, RaceExpertSignal> = withContext(Dispatchers.IO) {
-        if (meetings.isEmpty()) return@withContext emptyMap()
-        supervisorScope {
-            val uniqueMeetings = meetings.distinctBy { it.city }
-            val jobs = uniqueMeetings.flatMap { meeting ->
-                sources.map { source ->
-                    async {
-                        val fresh = withTimeoutOrNull(6200) { fetchSource(source, meeting.city, meeting.date) }
-                        val cached = if (fresh == null) loadCached(context, source.name, meeting.city, meeting.date) else null
-                        if (fresh != null) saveCached(context, source.name, meeting.city, meeting.date, fresh)
-                        Triple(meeting.city, source, fresh?.let { SourceDoc(source, it, true) }
-                            ?: cached?.let { SourceDoc(source, it, false) })
-                    }
-                }
-            }
-            val cityDocs = jobs.awaitAll()
-                .filter { it.third != null }
-                .groupBy({ it.first }, { it.third!! })
-
-            buildMap {
-                meetings.forEach { meeting ->
-                    val docs = cityDocs[meeting.city].orEmpty()
-                    meeting.races.forEach { race ->
-                        val supports = mutableMapOf<Int, MutableList<String>>()
-                        docs.forEach { doc ->
-                            val raceText = raceSection(doc.text, race.number)
-                            race.horses.forEach { horse ->
-                                val needle = normalize(horse.name)
-                                val supported = if (doc.source.strongOnly) {
-                                    strongMention(raceText, needle)
-                                } else {
-                                    horseMention(raceText, needle)
-                                }
-                                if (supported) supports.getOrPut(horse.no) { mutableListOf() }.add(doc.source.name)
-                            }
-                        }
-                        val freshCount = docs.count { it.fresh }
-                        val cachedCount = docs.size - freshCount
-                        put(raceKey(race), RaceExpertSignal(
-                            sourceCount = docs.size,
-                            configuredSourceCount = sources.size,
-                            freshSourceCount = freshCount,
-                            cachedSourceCount = cachedCount,
-                            activeSources = docs.map { it.source.name },
-                            byHorse = race.horses.associate { horse ->
-                                val src = supports[horse.no].orEmpty().distinct()
-                                horse.no to ExpertHorseSignal(src.size, docs.size, src)
-                            }
-                        ))
-                    }
-                }
-            }
-        }
-    }
-
-    private fun fetchSource(source: Source, city: String, date: String): String? {
-        source.candidates(city, date).forEach { url ->
-            fetchDocument(url)?.let { doc ->
-                val text = normalizeExpert(doc.body().text())
-                if (looksRelevant(text, city, date)) return text
-                discoverMatchingLink(doc, city, date)?.let { discovered ->
-                    fetchDocument(discovered)?.let { d2 ->
-                        val t2 = normalizeExpert(d2.body().text())
-                        if (looksRelevant(t2, city, date)) return t2
-                    }
-                }
-            }
-        }
-        source.discoveryPages(city, date).forEach { url ->
-            val doc = fetchDocument(url) ?: return@forEach
-            discoverMatchingLink(doc, city, date)?.let { discovered ->
-                fetchDocument(discovered)?.let { d2 ->
-                    val t2 = normalizeExpert(d2.body().text())
-                    if (looksRelevant(t2, city, date)) return t2
-                }
-            }
-        }
-        return null
-    }
-
-    private fun fetchDocument(url: String): Document? = runCatching {
-        val req = okhttp3.Request.Builder().url(url)
-            .header("User-Agent", "Mozilla/5.0 (Linux; Android 15; Mobile) AppleWebKit/537.36 Chrome/140 Mobile Safari/537.36")
-            .header("Accept-Language", "tr-TR,tr;q=0.9")
-            .build()
-        client.newCall(req).execute().use { r ->
-            if (!r.isSuccessful) null else {
-                val html = r.body?.string().orEmpty()
-                if (html.length < 250) null else Jsoup.parse(html, r.request.url.toString())
-            }
-        }
-    }.getOrNull()
-
-    private fun discoverMatchingLink(doc: Document, city: String, date: String): String? {
-        val cityN = normalize(city)
-        val (d, m, y) = dateParts(date)
-        val month = months[m-1]
-        return doc.select("a[href]").mapNotNull { a ->
-            val text = normalizeExpert(a.text() + " " + a.attr("href"))
-            val cityScore = if (text.contains(cityN)) 4 else 0
-            val dayScore = if (Regex("(^| )0?$d([ /-]|${'$'})").containsMatchIn(text)) 2 else 0
-            val monthScore = if (text.contains(month) || text.contains(m.toString().padStart(2,'0'))) 2 else 0
-            val yearScore = if (text.contains(y.toString())) 1 else 0
-            val topicScore = if (listOf("tahmin", "analiz", "kosu", "yaris", "bulten").any { text.contains(it) }) 2 else 0
-            val score = cityScore + dayScore + monthScore + yearScore + topicScore
-            val href = a.attr("abs:href").ifBlank { a.attr("href") }
-            if (score >= 6 && href.startsWith("http")) score to href else null
-        }.maxByOrNull { it.first }?.second
-    }
-
-    private fun looksRelevant(text: String, city: String, date: String): Boolean {
-        if (text.length < 180) return false
-        val cityN = normalize(city)
-        val (d, m, y) = dateParts(date)
-        val hasCity = text.contains(cityN)
-        val dateSignals = listOf(d.toString(), months[m-1], y.toString()).count { text.contains(it) }
-        val hasRaceLanguage = listOf("kosu", "tahmin", "favori", "rakip", "surpriz", "banko", "agf").any { text.contains(it) }
-        return hasCity && dateSignals >= 1 && hasRaceLanguage
-    }
-
-    private fun raceSection(text: String, raceNo: Int): String {
-        val patterns = listOf("$raceNo kosu", "$raceNo. kosu", "${raceNo}kosu", "${raceNo} kosu olan")
-        val starts = patterns.map { text.indexOf(it) }.filter { it >= 0 }
-        if (starts.isEmpty()) return text
-        val start = starts.minOrNull() ?: 0
-        val next = (raceNo + 1)
-        val ends = listOf("$next kosu", "$next. kosu", "${next}kosu").map { text.indexOf(it, start + 4) }.filter { it > start }
-        val end = ends.minOrNull() ?: min(text.length, start + 4500)
-        return text.substring(start, end)
-    }
-
-    private fun horseMention(text: String, needle: String): Boolean {
-        if (needle.length < 4) return false
-        var start = text.indexOf(needle)
-        while (start >= 0) {
-            val from = max(0, start - 180)
-            val end = min(text.length, start + needle.length + 260)
-            val snippet = text.substring(from, end)
-            if (listOf("favori", "ilk sans", "birinci", "rakip", "surpriz", "banko", "tek", "oner", "sansli", "aday", "plase").any { snippet.contains(it) }) return true
-            start = text.indexOf(needle, start + needle.length)
-        }
-        return false
-    }
-
-    private fun strongMention(text: String, needle: String): Boolean {
-        if (needle.length < 4) return false
-        var start = text.indexOf(needle)
-        while (start >= 0) {
-            val from = max(0, start - 180)
-            val end = min(text.length, start + needle.length + 320)
-            val snippet = text.substring(from, end)
-            if (Regex("★{3,5}").containsMatchIn(snippet) || listOf("favori", "banko", "tek", "ilk sans", "birinci").any { snippet.contains(it) }) return true
-            start = text.indexOf(needle, start + needle.length)
-        }
-        return false
-    }
-
-    private fun saveCached(context: Context, source: String, city: String, date: String, text: String) {
-        context.getSharedPreferences(PREF, Context.MODE_PRIVATE).edit()
-            .putString(cacheKey(source, city, date), text.take(120_000)).apply()
-    }
-
-    private fun loadCached(context: Context, source: String, city: String, date: String): String? =
-        context.getSharedPreferences(PREF, Context.MODE_PRIVATE).getString(cacheKey(source, city, date), null)
-
-    private fun cacheKey(source: String, city: String, date: String): String = "${normalize(source)}|${normalize(city)}|$date"
-
-    private fun normalizeExpert(v: String): String = v.lowercase(Locale.forLanguageTag("tr-TR"))
-        .replace("ı", "i").replace("ş", "s").replace("ğ", "g").replace("ü", "u").replace("ö", "o").replace("ç", "c")
-        .replace(Regex("[^a-z0-9 ★./:-]+"), " ").replace(Regex("\\s+"), " ").trim()
-
-    private fun dateParts(date: String): Triple<Int, Int, Int> {
-        val p = date.split("/")
-        return Triple(p.getOrNull(0)?.toIntOrNull() ?: 1, p.getOrNull(1)?.toIntOrNull() ?: 1, p.getOrNull(2)?.toIntOrNull() ?: 2026)
-    }
-    private fun slug(v: String): String = normalize(v).replace(" ", "-")
-    private fun normalize(v: String): String = v.lowercase(Locale.forLanguageTag("tr-TR"))
-        .replace("ı", "i").replace("ş", "s").replace("ğ", "g").replace("ü", "u").replace("ö", "o").replace("ç", "c")
-        .replace(Regex("[^a-z0-9 ]+"), " ").replace(Regex("\\s+"), " ").trim()
-    private fun urlEncode(v: String): String = URLEncoder.encode(v, "UTF-8")
-    private fun ganyanCityId(city: String): Int? = when (normalize(city)) {
-        "istanbul" -> 3; "bursa" -> 4; "ankara" -> 5; "izmir" -> 6; "adana" -> 1; "elazig" -> 8; "kocaeli" -> 10; "sanliurfa" -> 9; "diyarbakir" -> 7; "antalya" -> 11; else -> null
-    }
-}
 object TjkRepository {
     private const val BASE = "https://www.tjk.org"
     private val turkeyTz = java.util.TimeZone.getTimeZone("Europe/Istanbul")
@@ -834,73 +379,38 @@ object TjkRepository {
 }
 
 object Predictor {
-    fun picks(race: Race, expert: RaceExpertSignal? = null): List<Pick> {
+    fun picks(race: Race): List<Pick> {
         if (race.horses.isEmpty()) return emptyList()
         val maxHp = race.horses.mapNotNull { it.hp }.maxOrNull()?.coerceAtLeast(1) ?: 1
         val minWeight = race.horses.mapNotNull { it.weight }.minOrNull() ?: 0.0
         val minOdds = race.horses.mapNotNull { it.odds }.minOrNull()?.coerceAtLeast(.1) ?: 1.0
 
-        fun rankOf(horse: Horse, selector: (Horse) -> Double?): Int? {
-            val value = selector(horse) ?: return null
-            val vals = race.horses.mapNotNull { h -> selector(h)?.let { h.no to it } }
-                .sortedByDescending { it.second }
-            return vals.indexOfFirst { it.first == horse.no }.takeIf { it >= 0 }?.plus(1)
-        }
-        fun support(h: Horse): ExpertHorseSignal = expert?.byHorse?.get(h.no) ?: ExpertHorseSignal(totalSources = expert?.sourceCount ?: 0)
-        fun expertRank(h: Horse): Int? {
-            if ((expert?.sourceCount ?: 0) <= 0) return null
-            val ordered = race.horses.map { it.no to support(it).support }.sortedByDescending { it.second }
-            return ordered.indexOfFirst { it.first == h.no }.takeIf { it >= 0 }?.plus(1)
-        }
-        fun formScore(last6: String): Double {
-            val places = last6.filter { it in '1'..'9' }.map { it.digitToInt() }.takeLast(5)
-            if (places.isEmpty()) return 0.0
-            return places.mapIndexed { i, p -> ((6 - p).coerceAtLeast(0)) * (1.0 + i * .12) }.sum()
-        }
-        fun formLabel(last6: String): String {
-            val places = last6.filter { it in '1'..'9' }.map { it.digitToInt() }.takeLast(4)
-            if (places.size < 2) return "→ Veri sınırlı"
-            val recent = places.takeLast(2).average()
-            val older = places.take(places.size - 2).ifEmpty { places.take(1) }.average()
-            return when {
-                recent + .35 < older -> "↗ Yükseliyor"
-                recent > older + .7 -> "↘ Geriliyor"
-                places.count { it <= 3 } >= 2 -> "↑ Formda"
-                else -> "→ Dengeli"
-            }
-        }
-
         val raw = race.horses.map { h ->
-            var score = 34.0
+            var score = 42.0
             val reasons = mutableListOf<String>()
             h.agf?.let {
-                score += it * .55
+                score += it * .78
                 if (it >= 18) reasons += "AGF desteği yüksek"
             }
             h.hp?.let {
-                score += (it.toDouble() / maxHp) * 14
+                score += (it.toDouble() / maxHp) * 16
                 if (it >= maxHp - 5) reasons += "HP gruba göre güçlü"
             }
             h.weight?.let { w ->
                 val advantage = max(0.0, 5.0 - (w - minWeight))
-                score += advantage * 1.0
+                score += advantage * 1.25
                 if (w <= minWeight + 1.0) reasons += "kilo avantajı"
             }
             h.odds?.let { o ->
-                score += min(11.0, (minOdds / o) * 11)
+                score += min(13.0, (minOdds / o) * 13)
                 if (o <= minOdds * 1.6) reasons += "piyasa desteği"
             }
-            val fScore = formScore(h.last6)
-            score += min(13.0, fScore * .7)
-            if (formLabel(h.last6).contains("Yükseliyor") || formLabel(h.last6).contains("Formda")) reasons += "yakın formu olumlu"
+            val form = h.last6.takeLast(5)
+            val wins = form.count { it == '1' }
+            val places = form.count { it in '1'..'3' }
+            score += wins * 4.0 + places * 1.6
+            if (wins > 0) reasons += "yakın formunda galibiyet"
             if (h.best.isNotBlank()) reasons += "pist/mesafe derecesi var"
-
-            val ex = support(h)
-            if (ex.totalSources > 0) {
-                val ratio = ex.support.toDouble() / ex.totalSources
-                score += ratio * 17
-                if (ex.support > 0) reasons += "uzman desteği ${ex.support}/${ex.totalSources}"
-            }
             h to (score to reasons)
         }
 
@@ -908,28 +418,17 @@ object Predictor {
         val minRaw = raw.minOf { it.second.first }
         val sorted = raw.sortedByDescending { it.second.first }
         return sorted.mapIndexed { index, item ->
-            val h = item.first
             val normalized = if (maxRaw == minRaw) 70 else
-                (50 + ((item.second.first - minRaw) / (maxRaw - minRaw)) * 46).toInt().coerceIn(45, 96)
-            val agf = h.agf ?: 0
-            val hp = h.hp
-            val weight = h.weight
-            val ex = support(h)
+                (54 + ((item.second.first - minRaw) / (maxRaw - minRaw)) * 40).toInt().coerceIn(45, 94)
+            val agf = item.first.agf ?: 0
             val reasons = item.second.second.toMutableList()
             if (reasons.isEmpty()) {
                 when {
-                    agf in 1..8 -> reasons += "AGF desteği sınırlı; sürpriz senaryosunda değerlendirilebilir"
-                    hp != null && hp < maxHp - 10 -> reasons += "HP rakiplerin gerisinde; yarış temposuna ihtiyaç duyabilir"
-                    weight != null && weight > minWeight + 3 -> reasons += "kilo dezavantajı var"
-                    else -> reasons += "belirgin üstünlük yok; tempo ve pozisyon belirleyici"
+                    agf in 1..8 -> reasons += "AGF desteği sınırlı; sürpriz senaryosunda değerlendirilir"
+                    item.first.hp != null && item.first.hp < maxHp - 10 -> reasons += "HP rakiplerin gerisinde; yarış temposuna ihtiyaç duyabilir"
+                    item.first.weight != null && item.first.weight > minWeight + 3 -> reasons += "kilo dezavantajı var"
+                    else -> reasons += "belirgin üstünlük yok; yarış içi tempo ve pozisyon belirleyici"
                 }
-            }
-            val marketRank = rankOf(h) { it.agf?.toDouble() ?: it.odds?.let { o -> 100.0 / o } }
-            val market = when {
-                marketRank == 1 -> "Çok güçlü"
-                marketRank == 2 -> "Güçlü"
-                marketRank != null && marketRank <= 4 -> "Orta"
-                else -> "Zayıf"
             }
             val label = when {
                 index == 0 -> "Favori"
@@ -937,20 +436,7 @@ object Predictor {
                 agf <= 9 && normalized >= 60 -> "Sürpriz"
                 else -> "Alternatif"
             }
-            Pick(
-                horse = h,
-                score = normalized,
-                label = label,
-                reasons = reasons.distinct().take(4),
-                agfRank = rankOf(h) { it.agf?.toDouble() },
-                hpRank = rankOf(h) { it.hp?.toDouble() },
-                expertRank = expertRank(h),
-                expertSupport = ex.support,
-                expertTotal = ex.totalSources,
-                expertSources = ex.sources,
-                marketLabel = market,
-                formLabel = formLabel(h.last6)
-            )
+            Pick(item.first, normalized, label, reasons.distinct().take(3))
         }
     }
 }
@@ -966,55 +452,31 @@ fun TwoHorseApp() {
             onSurface = Ink
         )
     ) {
-        val context = LocalContext.current.applicationContext
-        val initialCache = remember { MeetingCache.load(context) }
-        var meetings by remember { mutableStateOf(initialCache) }
-        var expertSignals by remember { mutableStateOf<Map<String, RaceExpertSignal>>(emptyMap()) }
-        var loading by remember { mutableStateOf(initialCache.isEmpty()) }
-        var refreshing by remember { mutableStateOf(false) }
+        var meetings by remember { mutableStateOf<List<Meeting>>(emptyList()) }
+        var loading by remember { mutableStateOf(true) }
         var error by remember { mutableStateOf<String?>(null) }
         var selectedRace by remember { mutableStateOf<Race?>(null) }
         val scope = rememberCoroutineScope()
 
         fun refresh() {
             scope.launch {
-                refreshing = true
-                if (meetings.isEmpty()) loading = true
+                loading = true
                 error = null
                 val result = runCatching { TjkRepository.loadToday() }
-                val fresh = result.getOrDefault(emptyList())
-                if (fresh.isNotEmpty()) {
-                    meetings = fresh
-                    MeetingCache.save(context, fresh)
-                } else if (meetings.isEmpty()) {
-                    error = result.exceptionOrNull()?.message ?: "Türkiye programı bulunamadı."
-                }
+                meetings = result.getOrDefault(emptyList())
+                if (meetings.isEmpty()) error = result.exceptionOrNull()?.message ?: "Türkiye programı bulunamadı."
                 loading = false
-                refreshing = false
             }
         }
 
         LaunchedEffect(Unit) { refresh() }
-        LaunchedEffect(meetings) {
-            if (meetings.isNotEmpty()) {
-                expertSignals = ExpertRepository.load(context, meetings)
-            }
-        }
 
         BackHandler(enabled = selectedRace != null) { selectedRace = null }
 
         Surface(Modifier.fillMaxSize(), color = Bg) {
             selectedRace?.let { race ->
-                RaceDetail(race, expertSignals[raceKey(race)], onBack = { selectedRace = null })
-            } ?: Home(
-                meetings = meetings,
-                experts = expertSignals,
-                loading = loading,
-                refreshing = refreshing,
-                error = error,
-                onRefresh = ::refresh,
-                onRace = { selectedRace = it }
-            )
+                RaceDetail(race, onBack = { selectedRace = null })
+            } ?: Home(meetings, loading, error, onRefresh = ::refresh, onRace = { selectedRace = it })
         }
     }
 }
@@ -1022,9 +484,7 @@ fun TwoHorseApp() {
 @Composable
 fun Home(
     meetings: List<Meeting>,
-    experts: Map<String, RaceExpertSignal>,
     loading: Boolean,
-    refreshing: Boolean,
     error: String?,
     onRefresh: () -> Unit,
     onRace: (Race) -> Unit
@@ -1072,7 +532,7 @@ fun Home(
     val lowerRaceCount = lowerMeetings.sumOf { it.races.size }
 
     Column(Modifier.fillMaxSize()) {
-        TopHeader(onRefresh, refreshing)
+        TopHeader(onRefresh)
         when {
             loading -> LoadingState()
             meetings.isEmpty() -> EmptyState(error, onRefresh)
@@ -1089,7 +549,7 @@ fun Home(
 
                 if (quickRaces.size > 1) {
                     item { SectionHeader("Sıradaki yarışlar", "${leadCity.orEmpty()} · en yakın 6") }
-                    items(quickRaces.drop(1)) { race -> UpcomingRaceCard(race, nowTick, experts[raceKey(race)], onRace) }
+                    items(quickRaces.drop(1)) { race -> UpcomingRaceCard(race, nowTick, onRace) }
                 }
 
                 if (overflowLeadRaces.isNotEmpty()) {
@@ -1101,7 +561,7 @@ fun Home(
                         )
                     }
                     if (otherExpanded) {
-                        items(overflowLeadRaces) { race -> UpcomingRaceCard(race, nowTick, experts[raceKey(race)], onRace) }
+                        items(overflowLeadRaces) { race -> UpcomingRaceCard(race, nowTick, onRace) }
                     }
                 }
 
@@ -1110,7 +570,7 @@ fun Home(
                     item { SectionHeader("Diğer şehirler", "$lowerRaceCount koşu · ${lowerMeetings.size} şehir") }
                     visibleMeetings.forEach { meeting ->
                         item { MeetingHeader(meeting) }
-                        items(meeting.races) { race -> RaceCard(race, nowTick, experts[raceKey(race)], onRace) }
+                        items(meeting.races) { race -> RaceCard(race, nowTick, onRace) }
                     }
                 }
             }
@@ -1170,7 +630,7 @@ private fun countdownText(seconds: Long): String {
 
 
 @Composable
-private fun TopHeader(onRefresh: () -> Unit, refreshing: Boolean) {
+private fun TopHeader(onRefresh: () -> Unit) {
     val compact = LocalConfiguration.current.screenWidthDp < 360
     Surface(color = Bg) {
         Row(
@@ -1188,7 +648,7 @@ private fun TopHeader(onRefresh: () -> Unit, refreshing: Boolean) {
             Spacer(Modifier.width(12.dp))
             Column(Modifier.weight(1f)) {
                 Text("Two Horse", fontWeight = FontWeight.Black, fontSize = if (compact) 23.sp else 27.sp, color = Ink, maxLines = 1)
-                Text(if (refreshing) "Canlı veri güncelleniyor…" else "Türkiye yarış analizi", color = Muted, fontSize = 12.sp, maxLines = 1)
+                Text("Türkiye yarış analizi", color = Muted, fontSize = 12.sp, maxLines = 1)
             }
             IconButton(onClick = onRefresh, modifier = Modifier.size(48.dp)) {
                 Icon(Icons.Default.Refresh, "Yenile", tint = Ink)
@@ -1240,9 +700,9 @@ private fun NextRaceHero(race: Race?, nowTick: Long, onRace: (Race) -> Unit) {
 }
 
 @Composable
-private fun UpcomingRaceCard(race: Race, nowTick: Long, expert: RaceExpertSignal?, onRace: (Race) -> Unit) {
+private fun UpcomingRaceCard(race: Race, nowTick: Long, onRace: (Race) -> Unit) {
     val compact = LocalConfiguration.current.screenWidthDp < 360
-    val picks = remember(race, expert) { Predictor.picks(race, expert) }
+    val picks = remember(race) { Predictor.picks(race) }
     val favorite = picks.firstOrNull()
     val secs = secondsUntil(race.time, nowTick)
     Card(
@@ -1313,8 +773,8 @@ private fun MeetingHeader(meeting: Meeting) {
 }
 
 @Composable
-fun RaceCard(race: Race, nowTick: Long, expert: RaceExpertSignal?, onRace: (Race) -> Unit) {
-    val picks = remember(race, expert) { Predictor.picks(race, expert) }
+fun RaceCard(race: Race, nowTick: Long, onRace: (Race) -> Unit) {
+    val picks = remember(race) { Predictor.picks(race) }
     val favorite = picks.firstOrNull()
     val surprise = picks.firstOrNull { it.label == "Sürpriz" }
     Card(
@@ -1366,8 +826,8 @@ private fun ScoreBadge(score: Int) {
 }
 
 @Composable
-fun RaceDetail(race: Race, expert: RaceExpertSignal?, onBack: () -> Unit) {
-    val picks = remember(race, expert) { Predictor.picks(race, expert) }
+fun RaceDetail(race: Race, onBack: () -> Unit) {
+    val picks = remember(race) { Predictor.picks(race) }
     val surprise = picks.firstOrNull { it.label == "Sürpriz" } ?: picks.getOrNull(2)
     val compact = LocalConfiguration.current.screenWidthDp < 360
 
@@ -1407,8 +867,7 @@ fun RaceDetail(race: Race, expert: RaceExpertSignal?, onBack: () -> Unit) {
             }
         }
         if (picks.isNotEmpty()) {
-            item { ExpertStatusCard(expert) }
-            item { ResultHero(picks.first(), picks.getOrNull(1), surprise) }
+            item { ResultHero(picks.first(), surprise) }
             item { SectionTitle("Olası sıralama · tüm atlar") }
             items(picks, key = { it.horse.no }) { pick -> HorseCard(pick) }
             item {
@@ -1422,7 +881,7 @@ fun RaceDetail(race: Race, expert: RaceExpertSignal?, onBack: () -> Unit) {
         }
         item {
             Text(
-                "Güven puanı; TJK verileri (AGF, HP, kilo, ganyan, form, pist/mesafe) ile erişilebilen bağımsız uzman kaynaklarının desteğini birlikte değerlendirir. Uzman siteleri yanıt vermezse uygulama onları beklemeden TJK verisiyle çalışmaya devam eder. Tahmin garanti değildir.",
+                "Model; TJK programındaki AGF, HP, kilo, ganyan, son form ve pist/mesafe verilerini birlikte puanlar. Tüm koşan atlar listelenir; tahmin garanti değildir.",
                 color = Muted,
                 fontSize = 11.sp
             )
@@ -1431,41 +890,7 @@ fun RaceDetail(race: Race, expert: RaceExpertSignal?, onBack: () -> Unit) {
 }
 
 @Composable
-private fun ExpertStatusCard(expert: RaceExpertSignal?) {
-    val configured = expert?.configuredSourceCount ?: 7
-    val fresh = expert?.freshSourceCount ?: 0
-    val cached = expert?.cachedSourceCount ?: 0
-    val available = expert?.sourceCount ?: 0
-    Card(
-        colors = CardDefaults.cardColors(containerColor = Surface),
-        shape = RoundedCornerShape(16.dp),
-        border = CardDefaults.outlinedCardBorder()
-    ) {
-        Column(Modifier.fillMaxWidth().padding(13.dp)) {
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Text("Uzman verisi", fontWeight = FontWeight.Black, fontSize = 12.sp, color = Ink, modifier = Modifier.weight(1f))
-                Text("$available/$configured kaynak aktif", color = if (available > 0) Green else Muted, fontWeight = FontWeight.Bold, fontSize = 11.sp)
-            }
-            if (available > 0) {
-                Spacer(Modifier.height(4.dp))
-                Text(
-                    buildString {
-                        append("$fresh canlı")
-                        if (cached > 0) append(" · $cached önbellekten")
-                        expert?.activeSources?.takeIf { it.isNotEmpty() }?.let { append(" · "); append(it.joinToString(", ")) }
-                    },
-                    color = Muted, fontSize = 9.sp, maxLines = 2, overflow = TextOverflow.Ellipsis
-                )
-            } else {
-                Spacer(Modifier.height(4.dp))
-                Text("Uzman siteleri yanıt vermese bile TJK verisiyle analiz devam eder.", color = Muted, fontSize = 9.sp)
-            }
-        }
-    }
-}
-
-@Composable
-private fun ResultHero(favorite: Pick, rival: Pick?, surprise: Pick?) {
+private fun ResultHero(favorite: Pick, surprise: Pick?) {
     Card(colors = CardDefaults.cardColors(containerColor = Ink), shape = RoundedCornerShape(26.dp)) {
         Column(Modifier.padding(20.dp)) {
             Text("OLASI KAZANAN", color = Gold, fontWeight = FontWeight.ExtraBold, fontSize = 10.sp)
@@ -1473,53 +898,23 @@ private fun ResultHero(favorite: Pick, rival: Pick?, surprise: Pick?) {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Column(Modifier.weight(1f)) {
                     Text("#${favorite.horse.no} ${favorite.horse.name}", color = Color.White, fontWeight = FontWeight.Black, fontSize = 24.sp)
-                    Text("Güven Puanı ${favorite.score}/100", color = Color.White.copy(.72f), fontSize = 13.sp, fontWeight = FontWeight.Bold)
+                    Text("Model güveni ${favorite.score}/100", color = Color.White.copy(.66f), fontSize = 12.sp)
                 }
-                Box(Modifier.size(62.dp).background(Color.White.copy(.10f), CircleShape), contentAlignment = Alignment.Center) {
-                    Text(favorite.score.toString(), color = Gold, fontWeight = FontWeight.Black, fontSize = 20.sp)
+                Box(Modifier.size(58.dp).background(Color.White.copy(.10f), CircleShape), contentAlignment = Alignment.Center) {
+                    Icon(Icons.Default.Stars, null, tint = Gold, modifier = Modifier.size(29.dp))
                 }
             }
-            Spacer(Modifier.height(16.dp))
-            MetricLine("AGF", favorite.agfRank?.let { "#$it · %${favorite.horse.agf ?: 0}" } ?: "Veri yok")
-            MetricLine("HP", favorite.hpRank?.let { "#$it · ${favorite.horse.hp ?: 0} puan" } ?: "Veri yok")
-            MetricLine(
-                "Uzman desteği",
-                if (favorite.expertTotal > 0) {
-                    val rank = favorite.expertRank?.let { "#$it · " }.orEmpty()
-                    "$rank${favorite.expertSupport}/${favorite.expertTotal} kaynak"
-                } else "Kaynak bekleniyor / bulunamadı"
-            )
-            if (favorite.expertSources.isNotEmpty()) {
-                Text("Kaynaklar: ${favorite.expertSources.joinToString(", ")}", color = Color.White.copy(.55f), fontSize = 9.sp)
-            }
-            MetricLine("Piyasa", favorite.marketLabel)
-            MetricLine("Form", favorite.formLabel)
-
             if (favorite.reasons.isNotEmpty()) {
-                Spacer(Modifier.height(13.dp))
-                Text(favorite.reasons.joinToString(" · "), color = Color.White.copy(.76f), fontSize = 12.sp, lineHeight = 18.sp)
+                Spacer(Modifier.height(14.dp))
+                Text(favorite.reasons.joinToString(" · "), color = Color.White.copy(.78f), fontSize = 12.sp)
             }
-            if (rival != null || surprise != null) {
-                Spacer(Modifier.height(15.dp))
+            if (surprise != null) {
+                Spacer(Modifier.height(14.dp))
                 HorizontalDivider(color = Color.White.copy(.12f))
                 Spacer(Modifier.height(12.dp))
-                rival?.let {
-                    Text("En ciddi rakip: #${it.horse.no} ${it.horse.name} · ${it.score}/100", color = Color.White, fontWeight = FontWeight.Bold, fontSize = 12.sp)
-                }
-                surprise?.let {
-                    Spacer(Modifier.height(if (rival != null) 7.dp else 0.dp))
-                    Text("💣 Sürpriz: #${it.horse.no} ${it.horse.name} · ${it.score}/100", color = Color.White, fontWeight = FontWeight.Bold, fontSize = 12.sp)
-                }
+                Text("💣 Sürpriz  #${surprise.horse.no} ${surprise.horse.name}", color = Color.White, fontWeight = FontWeight.Bold)
             }
         }
-    }
-}
-
-@Composable
-private fun MetricLine(label: String, value: String) {
-    Row(Modifier.fillMaxWidth().padding(vertical = 2.dp), verticalAlignment = Alignment.CenterVertically) {
-        Text(label, color = Color.White.copy(.58f), fontSize = 11.sp, modifier = Modifier.weight(1f))
-        Text(value, color = Color.White, fontSize = 11.sp, fontWeight = FontWeight.SemiBold)
     }
 }
 
@@ -1535,12 +930,6 @@ private fun HorseCard(p: Pick) {
         "Sürpriz" -> Red
         else -> Gold
     }
-    val context = LocalContext.current
-    val scope = rememberCoroutineScope()
-    var videoExpanded by remember(p.horse.no, p.horse.videoUrl) { mutableStateOf(false) }
-    var videoLoading by remember(p.horse.no) { mutableStateOf(false) }
-    var videos by remember(p.horse.no) { mutableStateOf<List<RaceVideo>>(emptyList()) }
-
     Card(
         colors = CardDefaults.cardColors(containerColor = Surface),
         shape = RoundedCornerShape(18.dp),
@@ -1554,90 +943,47 @@ private fun HorseCard(p: Pick) {
             Column(Modifier.weight(1f)) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Text(p.horse.name, fontWeight = FontWeight.Black, fontSize = 15.sp, modifier = Modifier.weight(1f))
-                    Text("${p.score}/100", color = Green, fontWeight = FontWeight.Black, fontSize = 14.sp)
+                    Text(p.score.toString(), color = Green, fontWeight = FontWeight.Black)
                 }
-                Spacer(Modifier.height(4.dp))
+                Spacer(Modifier.height(3.dp))
                 Text(
                     listOfNotNull(
                         p.horse.jockey.takeIf { it.isNotBlank() },
-                        p.horse.weight?.let { "${it} kg" }
+                        p.horse.weight?.let { "${it} kg" },
+                        p.horse.hp?.let { "HP $it" },
+                        p.horse.agf?.let { "AGF %$it" }
                     ).joinToString(" · "),
                     color = Muted,
                     fontSize = 11.sp
                 )
-                Spacer(Modifier.height(8.dp))
-                Row(horizontalArrangement = Arrangement.spacedBy(7.dp)) {
-                    Box(Modifier.background(labelBg, RoundedCornerShape(50)).padding(horizontal = 9.dp, vertical = 5.dp)) {
-                        Text(p.label, color = labelFg, fontWeight = FontWeight.Bold, fontSize = 10.sp)
-                    }
+                Spacer(Modifier.height(7.dp))
+                Box(Modifier.background(labelBg, RoundedCornerShape(50)).padding(horizontal = 9.dp, vertical = 5.dp)) {
+                    Text(p.label, color = labelFg, fontWeight = FontWeight.Bold, fontSize = 10.sp)
                 }
-                Spacer(Modifier.height(9.dp))
-                DetailMetric("AGF", p.agfRank?.let { "#$it · %${p.horse.agf ?: 0}" } ?: "—")
-                DetailMetric("HP", p.hpRank?.let { "#$it · ${p.horse.hp ?: 0}" } ?: "—")
-                DetailMetric(
-                    "Uzman",
-                    if (p.expertTotal > 0) "${p.expertRank?.let { "#$it · " }.orEmpty()}${p.expertSupport}/${p.expertTotal}" else "—"
-                )
-                DetailMetric("Piyasa", p.marketLabel)
-                DetailMetric("Form", p.formLabel)
                 if (p.reasons.isNotEmpty()) {
-                    Spacer(Modifier.height(8.dp))
-                    Text(p.reasons.joinToString(" · "), color = Muted, fontSize = 11.sp, lineHeight = 16.sp)
+                    Spacer(Modifier.height(7.dp))
+                    Text(p.reasons.joinToString(" · "), color = Muted, fontSize = 11.sp)
                 }
-
                 p.horse.videoUrl?.let { videoUrl ->
-                    Spacer(Modifier.height(10.dp))
+                    val context = LocalContext.current
+                    Spacer(Modifier.height(9.dp))
                     OutlinedButton(
                         onClick = {
-                            if (videos.isNotEmpty()) {
-                                videoExpanded = !videoExpanded
-                            } else if (!videoLoading) {
-                                videoLoading = true
-                                scope.launch {
-                                    videos = VideoRepository.loadLast3(videoUrl)
-                                    videoLoading = false
-                                    videoExpanded = true
-                                }
+                            runCatching {
+                                context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(videoUrl)))
                             }
                         },
                         shape = RoundedCornerShape(12.dp),
                         contentPadding = PaddingValues(horizontal = 11.dp, vertical = 7.dp)
                     ) {
-                        if (videoLoading) {
-                            CircularProgressIndicator(strokeWidth = 2.dp, modifier = Modifier.size(15.dp))
-                        } else {
-                            Icon(Icons.Default.PlayArrow, contentDescription = null, modifier = Modifier.size(16.dp))
-                        }
+                        Icon(Icons.Default.PlayArrow, contentDescription = null, modifier = Modifier.size(16.dp))
                         Spacer(Modifier.width(5.dp))
-                        Text("Son 3 yarış videosu", fontWeight = FontWeight.Bold, fontSize = 10.sp)
+                        Text("Son yarış videoları", fontWeight = FontWeight.Bold, fontSize = 10.sp)
                     }
-                    if (videoExpanded) {
-                        if (videos.isEmpty() && !videoLoading) {
-                            Text("TJK video arşivinde uygun bağlantı bulunamadı.", color = Muted, fontSize = 9.sp)
-                        } else {
-                            videos.take(3).forEachIndexed { index, video ->
-                                TextButton(
-                                    onClick = { runCatching { context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(video.url))) } },
-                                    contentPadding = PaddingValues(horizontal = 2.dp, vertical = 2.dp)
-                                ) {
-                                    Icon(Icons.Default.PlayArrow, null, modifier = Modifier.size(14.dp))
-                                    Spacer(Modifier.width(4.dp))
-                                    Text(video.label.ifBlank { "Geçmiş yarış ${index + 1}" }, fontSize = 10.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                                }
-                            }
-                        }
-                    }
+                    Text("TJK resmi video arşivi · son 3 yarışı buradan aç", color = Muted, fontSize = 9.sp)
                 }
             }
         }
-    }
-}
-
-@Composable
-private fun DetailMetric(label: String, value: String) {
-    Row(Modifier.fillMaxWidth().padding(vertical = 1.dp)) {
-        Text(label, color = Muted, fontSize = 10.sp, modifier = Modifier.width(58.dp))
-        Text(value, color = Ink, fontSize = 10.sp, fontWeight = FontWeight.SemiBold)
     }
 }
 
