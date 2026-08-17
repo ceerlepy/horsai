@@ -405,12 +405,14 @@ object Predictor {
             val normalized = if (maxRaw == minRaw) 70 else
                 (54 + ((item.second.first - minRaw) / (maxRaw - minRaw)) * 40).toInt().coerceIn(45, 94)
             val agf = item.first.agf ?: 0
+        val hp = item.first.hp
+        val weight = item.first.weight
             val reasons = item.second.second.toMutableList()
             if (reasons.isEmpty()) {
                 when {
                     agf in 1..8 -> reasons += "AGF desteği sınırlı; sürpriz senaryosunda değerlendirilir"
-                    item.first.hp != null && item.first.hp < maxHp - 10 -> reasons += "HP rakiplerin gerisinde; yarış temposuna ihtiyaç duyabilir"
-                    item.first.weight != null && item.first.weight > minWeight + 3 -> reasons += "kilo dezavantajı var"
+                    hp != null && hp < maxHp - 10 -> reasons += "HP rakiplerin gerisinde; yarış temposuna ihtiyaç duyabilir"
+                    weight != null && weight > minWeight + 3 -> reasons += "kilo dezavantajı var"
                     else -> reasons += "belirgin üstünlük yok; yarış içi tempo ve pozisyon belirleyici"
                 }
             }
